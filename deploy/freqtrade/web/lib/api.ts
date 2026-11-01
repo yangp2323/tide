@@ -35,9 +35,9 @@ export async function api<T = any>(path: string, opts: Opts = {}): Promise<T> {
     throw new ApiError(navigator.onLine ? "连不上后台，请稍后再试" : "手机/电脑没有联网");
   }
 
-  // 登录过期：Caddy 会重新弹登录框
+  // 登录过期后回到登录页，保留当前页面
   if (r.status === 401) {
-    location.reload();
+    location.replace("/login/?next=" + encodeURIComponent(location.pathname + location.search));
     throw new ApiError("登录已过期", 401);
   }
 

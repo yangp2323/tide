@@ -1,21 +1,24 @@
 {
-  "name": "ft-panel-web",
+  "name": "tide-panel-web",
   "version": "1.0.0",
   "private": true,
   "packageManager": "pnpm@11.28.5",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "start": "next start"
   },
   "dependencies": {
-    "next": "15.1.6",
-    "react": "19.0.0",
-    "react-dom": "19.0.0"
+    "next": "15.5.28",
+    "react": "19.0.4",
+    "react-dom": "19.0.4"
   },
   "pnpm": {
     "strictDepBuilds": false,
-    "ignoredBuiltDependencies": ["sharp"]
+    "ignoredBuiltDependencies": [
+      "sharp"
+    ]
   },
   "devDependencies": {
     "@types/node": "22.10.2",

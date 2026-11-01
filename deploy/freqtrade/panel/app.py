@@ -1,4 +1,4 @@
-"""Freqtrade 管理后台：策略与选币（现货/合约、杠杆、做空）、回测、Bybit Key、Telegram、实盘资金上限。登录密码由 Caddy 负责。"""
+"""Tide 交易台：策略与选币（现货/合约、杠杆、做空）、回测、Bybit Key、Telegram、实盘资金上限。公网登录由 Next.js 负责，auth.py 校验内部服务令牌。"""
 import base64
 import json
 import sys
@@ -21,6 +21,7 @@ from pydantic import BaseModel
 UD = "/freqtrade/user_data"
 CFG = f"{UD}/config.json"
 PRIV = f"{UD}/config-private.json"
+WEB = "/panel/web"   # Next.js 静态导出的产物（setup.sh 构建），由文件末尾的 StaticFiles 托管
 FT = "http://freqtrade:8080/api/v1"
 SERVER_IP = os.environ.get("SERVER_IP", "")
 MIN_STAKE = 10       # 每笔至少 10 USDT（合约是保证金）：Bybit 下限 5 USDT，留出止损和手续费的余量
@@ -35,6 +36,20 @@ STABLE = {"USDC", "USDE", "USD1", "RLUSD", "FDUSD", "DAI", "PYUSD", "TUSD", "USD
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 app.mount("/fonts", StaticFiles(directory="/panel/fonts"), name="fonts")
+
+
+@app.middleware("http")
+async def cache_headers(request, call_next):
+    """前端是静态导出的：带哈希的 JS/CSS 缓存一年，HTML 每次校验，接口不缓存。"""
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith(("/_next/static/", "/fonts/")):
+        response.headers.setdefault("Cache-Control", "public, max-age=31536000, immutable")
+    elif path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    elif response.headers.get("content-type", "").startswith("text/html"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 
 
 def min_capital(max_open):
@@ -579,15 +594,22 @@ def holdings():
     return d
 
 
+import auth  # noqa: E402
+
+auth.install(app)
+
 import ai  # noqa: E402
 
 ai.init(sys.modules[__name__])
 app.include_router(ai.router)
 
-
-@app.get("/")
-def index():
-    return FileResponse("/panel/index.html", headers={"Cache-Control": "no-store"})
+# 前端：Next.js 静态导出（setup.sh 里构建到 panel/web）。没构建成功时回退到旧版单页 index.html。
+if os.path.isdir(WEB):
+    app.mount("/", StaticFiles(directory=WEB, html=True), name="web")
+else:
+    @app.get("/")
+    def index():
+        return FileResponse("/panel/index.html", headers={"Cache-Control": "no-store"})
 
 
 if __name__ == "__main__":

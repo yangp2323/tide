@@ -1,9 +1,9 @@
 set -e
-# 在服务器上部署 Freqtrade + 网页控制台。先把本目录和 strategies/TrendFollow.py 传到 /opt/freqtrade 再执行：
-#   scp -r deploy/freqtrade/* strategies/TrendFollow.py root@服务器:/opt/freqtrade/ && ssh root@服务器 bash /opt/freqtrade/setup.sh
+# 在服务器上部署 Freqtrade + 网页控制台。先把本目录和 strategies/TrendFollow.py 传到 /opt/tide 再执行：
+#   scp -r deploy/freqtrade/* strategies/TrendFollow.py root@服务器:/opt/tide/ && ssh root@服务器 bash /opt/tide/setup.sh
 # 可重复执行，不会覆盖已有的配置、Key 和交易记录。自定义域名：DOMAIN=example.com bash setup.sh（只在首次生成 .env 时生效）
 export DEBIAN_FRONTEND=noninteractive
-cd /opt/freqtrade
+cd /opt/tide
 command -v docker >/dev/null || { curl -fsSL https://get.docker.com | sh >/tmp/docker.log 2>&1 || { tail -20 /tmp/docker.log; exit 1; }; }
 systemctl enable --now docker >/dev/null 2>&1
 
@@ -19,7 +19,7 @@ if [ ! -f user_data/config.json ]; then
 JWT=$(openssl rand -hex 32); WS=$(openssl rand -hex 16); APIPASS=$(openssl rand -hex 16)
 cat > user_data/config.json <<J
 {
-  "bot_name": "bybit-trend-LIVE",
+  "bot_name": "tide-LIVE",
   "dry_run": false,
   "db_url": "sqlite:////freqtrade/user_data/tradesv3.live.sqlite",
   "trading_mode": "spot",
@@ -73,10 +73,10 @@ PANEL_USER=admin
 PANEL_HASH='$HASH'
 E
   chmod 600 .env
-  echo "admin / $PASS" > /root/freqtrade-panel.txt; chmod 600 /root/freqtrade-panel.txt
+  echo "admin / $PASS" > /root/tide-panel.txt; chmod 600 /root/tide-panel.txt
 fi
 
-# 443 由 ft-sni 按域名分流，sing-box 代理需要监听 127.0.0.1:8444（只改一次）
+# 443 由 tide-sni 按域名分流，sing-box 代理需要监听 127.0.0.1:8444（只改一次）
 SB=/etc/sing-box/conf/VLESS-REALITY-443.json
 if [ -f $SB ] && grep -q '"listen_port": 443' $SB; then
   python3 - <<'PY'
@@ -90,8 +90,29 @@ PY
 fi
 # 只开 443：证书走 443 的 TLS-ALPN 验证，不需要 80
 ufw allow 443/tcp >/dev/null; ufw delete allow 80/tcp >/dev/null 2>&1 || true
-docker compose pull -q
-docker compose up -d --remove-orphans
+
+# Next.js 负责公网登录和 API，Python 服务只接受内部令牌。
+python3 - <<'AUTH'
+from pathlib import Path
+import hashlib, json, os, secrets
+root = Path('/opt/tide')
+env = root / '.env'
+text = env.read_text()
+for name in ('PANEL_INTERNAL_TOKEN', 'PANEL_SESSION_SECRET'):
+    if name + '=' not in text:
+        text += '\n' + name + '=' + secrets.token_hex(32) + '\n'
+env.write_text(text)
+auth = root / 'user_data/panel-auth.json'
+if not auth.exists():
+    username, password = Path('/root/tide-panel.txt').read_text().strip().split(' / ', 1)
+    salt = secrets.token_hex(16)
+    digest = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt), n=16384, r=8, p=1).hex()
+    auth.write_text(json.dumps(dict(username=username, salt=salt, password_hash=digest)))
+    os.chmod(auth, 0o600)
+    os.chown(auth, 1000, 1000)
+AUTH
+
+docker compose up -d --build
 . ./.env
 echo "控制台地址: https://trade.$DOMAIN"
-echo "登录: $(cat /root/freqtrade-panel.txt)"
+echo "登录信息保存在 /root/tide-panel.txt"

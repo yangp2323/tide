@@ -1,4 +1,4 @@
-# 量化交易
+# Tide · Bybit 量化交易
 
 Bybit 自动交易（现货或 USDT 永续合约），全部跑在东京服务器上（38.175.201.84），电脑关机不影响。
 
@@ -67,10 +67,16 @@ Bybit 自动交易（现货或 USDT 永续合约），全部跑在东京服务�
 
 ## 服务器上的结构
 
-`/opt/freqtrade`：Docker 跑四个容器——`freqtrade`（交易机器人）、`ft-panel`（管理后台和回测）、`ft-caddy`（HTTPS 和登录密码）、`ft-sni`（443 端口按域名分流：juyouagent.com 走后台，其余走 sing-box 代理）。
+`/opt/tide`：Docker 跑五个容器——`tide-bot`（交易机器人）、`tide-panel`（内部 FastAPI：策略、回测、AI）、`tide-web`（Next.js：页面、登录、`/api` 入口）、`tide-caddy`（HTTPS）、`tide-sni`（443 端口按域名分流：juyouagent.com 走控制台，其余走 sing-box 代理）。
 Key 和 Telegram 只存在服务器 `user_data/config-private.json`（权限 600）。
 
-修改策略或后台后重新部署：
+公网只认 Next.js：Caddy 反代到 `web:3000`，登录态是 HMAC 签名 Cookie（`__Host-tide_session`，12 小时）；`web` 的 Route Handler 带内部令牌转发给 `panel:8000`，Python 服务不对外暴露。
+
+重新部署（`node_modules` 有几百 MB，用 tar 打包再传）：
 ```bash
-scp -r deploy/freqtrade/* strategies/TrendFollow.py root@38.175.201.84:/opt/freqtrade/ && ssh root@38.175.201.84 "bash /opt/freqtrade/setup.sh && cd /opt/freqtrade && docker compose restart"
+tar -czf deploy.tgz --exclude=node_modules --exclude=.next --exclude=out -C deploy/freqtrade . \
+  && scp deploy.tgz strategies/TrendFollow.py root@38.175.201.84:/root/ \
+  && ssh root@38.175.201.84 "tar -xzf /root/deploy.tgz -C /opt/tide && mv -f /root/TrendFollow.py /opt/tide/ && rm -f /root/deploy.tgz && bash /opt/tide/setup.sh"
 ```
+
+`setup.sh` 可重复执行：不会覆盖 `.env`、Key、交易记录；`web` 是挂载源码 + `next dev`，只改页面时直接改服务器 `/opt/tide/web` 就会热更新，不用重启。

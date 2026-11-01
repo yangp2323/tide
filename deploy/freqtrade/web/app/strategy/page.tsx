@@ -383,7 +383,6 @@ export default function StrategyPage() {
         <Card
           title="回测结果"
           note={`${fut ? `合约 ${cur.leverage}×${cur.short ? " 多空" : " 只做多"}` : "现货"} · ${bt.pairs?.length || cur.pairs.length} 个币 · 最多 ${cur.max_open} 笔`}
-          style={{ marginTop: 16 }}
         >
           <div className="bt-head">
             <div className={"big " + sign(bt.profit)}>{pct(bt.profit)}</div>

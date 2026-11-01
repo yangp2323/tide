@@ -1,12 +1,10 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import "./ui.css";
-import { FeedbackProvider } from "@/components/Feedback";
-import { Shell } from "@/components/Shell";
-import { OvProvider } from "@/lib/store";
+import { AppRoot } from "@/components/AppRoot";
 
 export const metadata: Metadata = {
-  title: "Freqtrade 管理后台",
+  title: "Tide 交易台",
   description: "Bybit 量化交易管理后台：持仓、交易记录、策略、AI 交易与风控",
   robots: { index: false, follow: false },
 };
@@ -21,11 +19,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="zh-CN">
       <body>
-        <OvProvider>
-          <FeedbackProvider>
-            <Shell>{children}</Shell>
-          </FeedbackProvider>
-        </OvProvider>
+        <AppRoot>{children}</AppRoot>
       </body>
     </html>
   );

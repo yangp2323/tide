@@ -49,8 +49,8 @@ export default function OverviewPage() {
   const n = (p.winning_trades || 0) + (p.losing_trades || 0);
 
   return (
-    <>
-      <div className="grid g3">
+    <div className="overview-dashboard">
+      <div className="grid g3 overview-top">
         <Card>
           <div className="hero">
             <div style={{ flex: 1, minWidth: 0 }}>
@@ -93,7 +93,7 @@ export default function OverviewPage() {
         </Card>
       </div>
 
-      <div className="kpis" style={{ marginTop: 16 }}>
+      <div className="kpis">
         <div className="kpi">
           <div className="k">机器人账户</div>
           <div className="v">
@@ -146,7 +146,7 @@ export default function OverviewPage() {
       <Card
         title="盯盘"
         note={d.short ? "价格在 200 线上方找做多机会，下方找做空机会" : "三个条件都满足、并且 20 线刚刚上穿 50 线时开多"}
-        style={{ marginTop: 16 }}
+        className="overview-watch"
       >
         {!loaded ? (
           <Skeleton lines={3} height={40} />
@@ -164,7 +164,7 @@ export default function OverviewPage() {
         </div>
       </Card>
 
-      <div className="grid g2">
+      <div className="grid g2 overview-bottom">
         <Card title="近 30 天每日盈亏">{loaded ? <DailyBars days={d.daily || []} /> : <Skeleton lines={5} />}</Card>
 
         <Card
@@ -208,6 +208,6 @@ export default function OverviewPage() {
           )}
         </Card>
       </div>
-    </>
+    </div>
   );
 }

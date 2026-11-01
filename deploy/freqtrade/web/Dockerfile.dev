@@ -1,0 +1,5 @@
+FROM node:alpine
+RUN npm install -g pnpm@11.28.5
+WORKDIR /app
+ENV NEXT_TELEMETRY_DISABLED=1
+CMD ["sh", "-c", "pnpm install --frozen-lockfile && exec pnpm dev --hostname 0.0.0.0"]

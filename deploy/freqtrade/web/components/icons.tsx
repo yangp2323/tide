@@ -1,6 +1,8 @@
 /** 侧边栏 / 顶部栏用到的线框图标，统一 20×20、1.7 描边。 */
 const S = {
   viewBox: "0 0 20 20",
+  width: 18,
+  height: 18,
   fill: "none",
   stroke: "currentColor",
   strokeWidth: 1.7,
@@ -70,6 +72,14 @@ export const IconLogs = () => (
 export const IconMenu = () => (
   <svg {...S}>
     <path d="M3 6h14M3 10h14M3 14h14" />
+  </svg>
+);
+
+export const IconMore = () => (
+  <svg {...S}>
+    <circle cx="4.5" cy="10" r="1.2" fill="currentColor" stroke="none" />
+    <circle cx="10" cy="10" r="1.2" fill="currentColor" stroke="none" />
+    <circle cx="15.5" cy="10" r="1.2" fill="currentColor" stroke="none" />
   </svg>
 );
 

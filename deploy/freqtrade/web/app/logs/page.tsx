@@ -40,8 +40,20 @@ export default function LogsPage() {
     return () => clearInterval(t);
   }, [auto, load]);
 
+  // 只有原本就在底部时才跟着滚；向上翻看历史时不要被自动刷新拉回去
+  const stick = useRef(true);
   useEffect(() => {
-    if (rows && box.current) box.current.scrollTop = box.current.scrollHeight;
+    const el = box.current;
+    if (!el) return;
+    const onScroll = () => {
+      stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    };
+    el.addEventListener("scroll", onScroll);
+    return () => el.removeEventListener("scroll", onScroll);
+  }, []);
+
+  useEffect(() => {
+    if (rows && box.current && stick.current) box.current.scrollTop = box.current.scrollHeight;
   }, [rows]);
 
   const shown = (rows || []).filter((l) => !onlyErr || ["WARNING", "ERROR", "CRITICAL"].includes(l[3]));

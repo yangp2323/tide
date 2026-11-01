@@ -69,7 +69,7 @@ export default function AiPage() {
   const [model, setModel] = useState(DEFAULT_MODEL.anthropic);
   const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
-  const [interval, setInterval] = useState(240);
+  const [freq, setFreq] = useState(240);
   const [conf, setConf] = useState(0.6);
   const [maxDay, setMaxDay] = useState(3);
   const [loss, setLoss] = useState(5);
@@ -78,7 +78,7 @@ export default function AiPage() {
     setProvider(c.provider);
     setModel(c.model);
     setBaseUrl(c.base_url || "");
-    setInterval(c.interval);
+    setFreq(c.interval);
     setConf(c.min_confidence);
     setMaxDay(c.max_entries_per_day);
     setLoss(c.max_daily_loss_pct);
@@ -117,7 +117,7 @@ export default function AiPage() {
         model,
         base_url: baseUrl,
         api_key: apiKey || null,
-        interval,
+        interval: freq,
         min_confidence: conf,
         max_entries_per_day: maxDay,
         max_daily_loss_pct: loss,
@@ -253,7 +253,7 @@ export default function AiPage() {
                   <label className="f" htmlFor="aiInterval">
                     分析频率
                   </label>
-                  <select id="aiInterval" value={interval} onChange={(e) => setInterval(+e.target.value)}>
+                  <select id="aiInterval" value={freq} onChange={(e) => setFreq(+e.target.value)}>
                     <option value={240}>每 4 小时（K 线收盘后）</option>
                     <option value={60}>每小时</option>
                   </select>
@@ -291,7 +291,6 @@ export default function AiPage() {
       <Card
         title="决策记录"
         note="最近 20 次，最新在最上面"
-        style={{ marginTop: 16 }}
         right={
           <button className="ghost sm" onClick={load} disabled={busy === "load"}>
             刷新

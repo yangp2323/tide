@@ -40,7 +40,6 @@ export default function NotifyPage() {
     <Card
       title="Telegram 通知"
       right={<StateLabel on={on}>{on ? "已连接" : "未设置"}</StateLabel>}
-      style={{ maxWidth: 640 }}
     >
       <ol className="steps">
         <li>

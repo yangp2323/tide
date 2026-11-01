@@ -11,8 +11,5 @@
 }
 
 trade.{$DOMAIN}, {$DOMAIN}, www.{$DOMAIN} {
-	basic_auth {
-		{$PANEL_USER} {$PANEL_HASH}
-	}
-	reverse_proxy panel:8000
+	reverse_proxy web:3000
 }

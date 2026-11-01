@@ -10,6 +10,7 @@ import {
   IconAi,
   IconLogs,
   IconMenu,
+  IconMore,
   IconNotify,
   IconOverview,
   IconPositions,
@@ -53,7 +54,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
   useEffect(() => setOpen(false), [pathname]);
 
   useEffect(() => {
-    document.title = `${current.label} · Freqtrade`;
+    document.title = `${current.label} · Tide`;
   }, [current.label]);
 
   const fut = d.market === "futures";
@@ -114,7 +115,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
             />
           </svg>
           <div>
-            <b>Freqtrade</b>
+            <b>Tide</b>
             <small>{d.server_ip || "管理后台"}</small>
           </div>
         </div>
@@ -147,9 +148,14 @@ export function Shell({ children }: { children: React.ReactNode }) {
             <h1>{current.label}</h1>
             <span className="sp" />
             <span className={"pill mk" + (fut ? " fut" : "")}>
-              {fut ? `合约 ${d.leverage}×${d.short ? " 多空" : ""}` : "现货"}
+              {fut ? `合约 ${d.leverage}×` : "现货"}
+              {fut && d.short ? <span className="hide-sm"> 多空</span> : null}
             </span>
             <span className="pill live">实盘</span>
+            <button className="ghost sm" onClick={async () => {
+              try { await post("/api/auth/logout"); location.replace("/login/"); }
+              catch { toast("退出失败，请重试", "err"); }
+            }}>退出登录</button>
             {stopped && (
               <button className="sm" disabled={botBusy} onClick={() => bot("start")}>
                 启动
@@ -171,7 +177,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
           </div>
         </div>
 
-        <div className="content">
+        <div className={"content " + (path === "/" ? "overview-content" : `workspace-content page-${path.slice(1).replace(/[^a-z-]/g, "")}`)}>
           {offline && (
             <div className="msg warn banner" role="status">
               {offline}
@@ -197,7 +203,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
           记录
         </Link>
         <button className={"tab" + (SETUP.some((s) => norm(s.href) === path) ? " on" : "")} onClick={() => setOpen(true)}>
-          <IconMenu />
+          <IconMore />
           更多
         </button>
       </div>
