@@ -1,0 +1,7 @@
+# pnpm 11 把安装脚本的白名单放在这里（package.json 的 pnpm 字段已不再读取）。
+# sharp 只是 next/image 的可选依赖，静态导出用不到，不必编译。
+onlyBuiltDependencies: []
+ignoredBuiltDependencies:
+  - sharp
+strictDepBuilds: false
+verifyDepsBeforeRun: false

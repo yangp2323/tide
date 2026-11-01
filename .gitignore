@@ -1,0 +1,14 @@
+deploy/secrets/
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+.venv/
+__pycache__/
+*.py[cod]
+*.tsbuildinfo
+node_modules/
+.next/
+out/
+deploy/freqtrade/user_data/

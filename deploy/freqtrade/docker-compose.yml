@@ -1,0 +1,59 @@
+services:
+  freqtrade:
+    image: freqtradeorg/freqtrade:stable
+    container_name: freqtrade
+    restart: unless-stopped
+    mem_limit: 700m
+    volumes:
+      - ./user_data:/freqtrade/user_data
+    command: >
+      trade
+      --logfile /freqtrade/user_data/logs/freqtrade.log
+      --config /freqtrade/user_data/config.json
+      --config /freqtrade/user_data/config-private.json
+      --strategy TrendFollow
+
+  # 网页控制台：填 Key / Telegram、切实盘
+  panel:
+    image: freqtradeorg/freqtrade:stable
+    container_name: ft-panel
+    restart: unless-stopped
+    mem_limit: 700m
+    environment:
+      - SERVER_IP=${SERVER_IP}
+    volumes:
+      - ./user_data:/freqtrade/user_data
+      - ./panel:/panel:ro
+    # AI 交易要用大模型 SDK，镜像里没有，第一次启动时装上
+    entrypoint: ["sh", "-c", "python -c 'import anthropic, openai' 2>/dev/null || pip install -q --user anthropic openai; exec python /panel/app.py"]
+    depends_on: [freqtrade]
+
+  # HTTPS + 登录密码
+  caddy:
+    image: caddy:2-alpine
+    container_name: ft-caddy
+    restart: unless-stopped
+    mem_limit: 100m
+    ports:
+      - "127.0.0.1:8443:443"
+    environment:
+      - DOMAIN=${DOMAIN}
+      - PANEL_USER=${PANEL_USER}
+      - PANEL_HASH=${PANEL_HASH}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on: [panel]
+
+  # 443 端口按域名分流：控制台域名 → caddy，其余 → sing-box 代理（已改到 127.0.0.1:8444）
+  sni:
+    image: nginx:alpine
+    container_name: ft-sni
+    restart: unless-stopped
+    mem_limit: 50m
+    network_mode: host
+    volumes:
+      - ./sni.conf:/etc/nginx/nginx.conf:ro
+
+volumes:
+  caddy_data:
