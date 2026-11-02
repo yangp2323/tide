@@ -1,5 +1,7 @@
 # 服务器部署（东京 VPS）
 
+本地 SSH 连接名称：`s-tokyo`（`ssh s-tokyo`）；服务器项目目录：`/opt/tide`。
+
 敏感信息（IP、密码、节点链接、控制台登录）在 `secrets/服务器信息.md`，该目录已被 .gitignore 忽略。
 
 | 文件 | 作用 |

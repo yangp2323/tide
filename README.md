@@ -62,7 +62,7 @@ Bybit 自动交易（现货或 USDT 永续合约），全部跑在东京服务�
 - `GET /api/ai/snapshot` 行情快照、`POST /api/ai/order` 下单（`{"action": "open_long|open_short|close", "pair": "BTC/USDT", "reason": "…"}`，同样过风控）、`POST /api/ai/run?execute=false` 让服务器上的模型分析一次、`GET /api/ai/log` 决策记录
 - MCP（给 Claude Code / Claude Desktop 用）：`mcp/trade_mcp.py`，需要本地 `pip install mcp httpx`
   ```bash
-  claude mcp add bybit-trade -e PANEL_PASS=后台密码 -- python D:/coding/quant-trading/mcp/trade_mcp.py
+  claude mcp add bybit-trade -e PANEL_PASS=后台密码 -- python D:/coding/tide/mcp/trade_mcp.py
   ```
 
 ## 服务器上的结构

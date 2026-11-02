@@ -7,7 +7,7 @@
   PANEL_PASS  后台登录密码（deploy/secrets/服务器信息.md）
 
 注册到 Claude Code：
-  claude mcp add bybit-trade -e PANEL_PASS=密码 -- python D:/coding/quant-trading/mcp/trade_mcp.py
+  claude mcp add bybit-trade -e PANEL_PASS=密码 -- python D:/coding/tide/mcp/trade_mcp.py
 """
 import json
 import os
