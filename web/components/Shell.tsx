@@ -11,6 +11,7 @@ import {
   IconLogs,
   IconMenu,
   IconMore,
+  IconKnowledge,
   IconNotify,
   IconOverview,
   IconPositions,
@@ -30,6 +31,7 @@ const TRADE: Item[] = [
 const SETUP: Item[] = [
   { href: "/strategy/", label: "交易配置", icon: IconStrategy },
   { href: "/ai/", label: "AI 交易", icon: IconAi },
+  { href: "/knowledge/", label: "知识库", icon: IconKnowledge },
   { href: "/account/", label: "账户与资金", icon: IconAccount },
   { href: "/notify/", label: "通知", icon: IconNotify },
   { href: "/logs/", label: "运行日志", icon: IconLogs },

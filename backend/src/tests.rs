@@ -378,6 +378,63 @@ async fn execution_is_durable_and_closing_releases_position_slots() {
             .json(&body)
             .send()
     };
+    // The knowledge base starts with the built-in notes and can be edited.
+    let r = http
+        .get(format!("{}/knowledge", url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let notes: Value = r.json().await.unwrap();
+    assert!(notes.as_array().unwrap().len() >= 6);
+    let r = send(
+        "/knowledge",
+        "POST",
+        json!({"title":"我的想法","content":"只在 ADX 大于 25 时做突破"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.status(), 200);
+    let id = r.json::<Value>().await.unwrap()["id"].as_i64().unwrap();
+    assert_eq!(
+        send("/knowledge", "POST", json!({"title":"","content":"x"}))
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    let r = send(
+        &format!("/knowledge/{}", id),
+        "POST",
+        json!({"enabled":false}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.status(), 200);
+    let mine = app
+        .store
+        .knowledge()
+        .unwrap()
+        .into_iter()
+        .find(|k| k["id"] == id)
+        .unwrap();
+    assert_eq!(mine["enabled"], false);
+    assert_eq!(mine["title"], "我的想法");
+    assert_eq!(
+        send(&format!("/knowledge/{}", id), "DELETE", json!({}))
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        send(&format!("/knowledge/{}", id), "DELETE", json!({}))
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
     let r = send(
         "/ai/channels",
         "POST",

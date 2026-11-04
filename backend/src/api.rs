@@ -121,6 +121,36 @@ pub fn validate(c: &Config) -> Result<()> {
     );
     Ok(())
 }
+/// Title, content, source and enabled flag of a knowledge note; fields missing from the
+/// request keep the values of `current`.
+fn knowledge_fields(
+    body: &Value,
+    current: Option<&Value>,
+) -> Result<(String, String, String, bool)> {
+    let text = |key: &str| -> String {
+        body[key]
+            .as_str()
+            .or_else(|| current.and_then(|c| c[key].as_str()))
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let (title, content, source) = (text("title"), text("content"), text("source"));
+    ensure!(
+        !title.is_empty() && title.chars().count() <= 80,
+        "标题须为 1 到 80 个字符"
+    );
+    ensure!(
+        !content.is_empty() && content.chars().count() <= 4000,
+        "内容须为 1 到 4000 个字符"
+    );
+    ensure!(source.chars().count() <= 600, "来源不超过 600 个字符");
+    let enabled = body["enabled"]
+        .as_bool()
+        .or_else(|| current.and_then(|c| c["enabled"].as_bool()))
+        .unwrap_or(true);
+    Ok((title, content, source, enabled))
+}
 fn ai_public(c: &AiConfig) -> Value {
     let mut v = json!(c);
     v["api_key"] = json!(mask(&c.api_key));
@@ -186,6 +216,7 @@ async fn handle(
             }
             "/api/ai/snapshot" => app.snapshot().await,
             "/api/ai/log" => Ok(json!(app.store.decisions(limit(q, 50, 500))?)),
+            "/api/knowledge" => Ok(json!(app.store.knowledge()?)),
             "/api/stops" => app.store.stop_history(limit(q, 50, 500)),
             "/api/orders/pending" => Ok(json!(app.store.unresolved()?)),
             _ => bail!("接口不存在"),
@@ -401,6 +432,32 @@ async fn handle(
             c.ai = a;
             app.store.save_config(&c)?;
             return Ok(ai_public(&c.ai));
+        }
+        ("POST", "/api/knowledge") => {
+            ensure!(app.store.knowledge()?.len() < 40, "最多保存 40 条笔记");
+            let (title, content, source, enabled) = knowledge_fields(&body, None)?;
+            let id = app
+                .store
+                .knowledge_add(&title, &content, &source, enabled)?;
+            return Ok(json!({"id":id}));
+        }
+        _ if method == "POST" && path.starts_with("/api/knowledge/") => {
+            let id: i64 = path.trim_start_matches("/api/knowledge/").parse()?;
+            let current = app
+                .store
+                .knowledge()?
+                .into_iter()
+                .find(|k| k["id"] == id)
+                .context("笔记不存在")?;
+            let (title, content, source, enabled) = knowledge_fields(&body, Some(&current))?;
+            app.store
+                .knowledge_update(id, &title, &content, &source, enabled)?;
+            return Ok(json!({}));
+        }
+        _ if method == "DELETE" && path.starts_with("/api/knowledge/") => {
+            let id: i64 = path.trim_start_matches("/api/knowledge/").parse()?;
+            ensure!(app.store.knowledge_delete(id)?, "笔记不存在");
+            return Ok(json!({}));
         }
         ("POST", "/api/ai/channels") => {
             ensure!(c.ai.channels.len() < 8, "最多保存 8 个渠道");

@@ -229,3 +229,11 @@
   .ai-settings input, .ai-settings select { font-size: 16px; }
   .ai-settings .ai-budget input, .ai-settings > .row button { max-width: none; width: 100%; }
 }
+.kb input, .kb textarea { width: 100%; margin-top: 8px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; font: inherit; background: #fff; color: var(--ink); }
+.kb textarea { resize: vertical; line-height: 1.7; min-height: 96px; }
+.kb input:focus, .kb textarea:focus { border-color: var(--ink); outline: none; box-shadow: 0 0 0 3px rgba(18,26,38,.08); }
+.kb-note { padding: 14px 0 6px; border-top: 1px solid var(--line); }
+.kb-note:first-of-type { border-top: 0; padding-top: 0; }
+.kb-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+.kb-note .toggle input { width: 38px; height: 22px; min-height: 22px; margin-top: 0; padding: 0; border: 0; border-radius: 22px; background: var(--line); }
+.kb-note .toggle input:checked { background: var(--down); }

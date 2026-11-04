@@ -69,6 +69,13 @@ export const IconLogs = () => (
   </svg>
 );
 
+export const IconKnowledge = () => (
+  <svg {...S}>
+    <path d="M4 4.5A1.5 1.5 0 0 1 5.5 3H16v13H5.5A1.5 1.5 0 0 0 4 17.5z" />
+    <path d="M4 17.5A1.5 1.5 0 0 0 5.5 19H16M8 7h4.5M8 10h4.5" />
+  </svg>
+);
+
 export const IconMenu = () => (
   <svg {...S}>
     <path d="M3 6h14M3 10h14M3 14h14" />

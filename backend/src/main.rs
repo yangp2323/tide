@@ -4,6 +4,7 @@ mod auth;
 mod engine;
 mod exchange;
 mod indicators;
+mod knowledge_seed;
 mod mcp;
 mod migrate;
 mod model;
