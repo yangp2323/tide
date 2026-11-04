@@ -12,6 +12,7 @@ export default function PositionsPage() {
   const { busy, run } = useAction();
   const [hold, setHold] = useState<any>(null);
   const [holdErr, setHoldErr] = useState("");
+  const [stops, setStops] = useState<any[]>([]);
   const [holdLoading, setHoldLoading] = useState(true);
 
   const open: any[] = d.open || [];
@@ -22,6 +23,7 @@ export default function PositionsPage() {
     try {
       const h = await api<any>("/api/holdings");
       setHold(h);
+      setStops(await api<any[]>("/api/stops?limit=30").catch(() => []));
       setHoldErr("");
     } catch (e: any) {
       setHoldErr(e?.message || "读取失败");
@@ -237,6 +239,37 @@ export default function PositionsPage() {
             )}
           </>
         ) : null}
+      </Card>
+
+      <Card title="止盈止损调整记录" note={stops.length ? `最近 ${stops.length} 条` : ""}>
+        {stops.length ? (
+          <div className="scroll">
+            <table className="tbl">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>币种</th>
+                  <th>来源</th>
+                  <th className="r">止损价</th>
+                  <th className="r">止盈价</th>
+                </tr>
+              </thead>
+              <tbody>
+                {stops.map((s, i) => (
+                  <tr key={i}>
+                    <td>{when(s.time)}</td>
+                    <td className="p">{base(s.pair)}</td>
+                    <td>{{ open: "开仓", ai: "AI 调整", trail: "系统追踪" }[s.source as string] || s.source}</td>
+                    <td className="r">{price(s.stop)}</td>
+                    <td className="r">{s.take_profit > 0 ? price(s.take_profit) : "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <Empty>还没有调整记录。</Empty>
+        )}
       </Card>
     </>
   );

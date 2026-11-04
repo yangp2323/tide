@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 const SYSTEM: &str = r#"You manage a Bybit crypto account. Your primary objective is to grow account equity through positive expected net profit over repeated trades, accounting for fees, slippage and funding costs where applicable. Actively seek evidence-backed long and short opportunities within the supplied risk limits. Evaluate entries, holding and exits by their expected future return; do not make breaking even on a position the objective. Do not force trades when the evidence does not support positive expected net profit, and do not invent unavailable cost estimates or imply guaranteed returns.
 Use only the supplied closed candles and account snapshot. Return only a JSON object {"analysis":"简体中文分析","actions":[{"action":"open_long|open_short|close|set_stops","pair":"exact pair from snapshot","confidence":0.0,"reason":"简体中文理由"}]}. For open_long/open_short also give stop_loss_pct and take_profit_pct (percent of entry price, e.g. 4.5). For set_stops on an open position give stop_loss_price and/or take_profit_price as absolute prices (take_profit_price 0 removes the take profit). Explain the opportunity or lack of opportunity using specific supplied trend, momentum, volatility and price signals, including the expected direction and what would invalidate the thesis. For each action, explain how it serves the net profit objective. When actions is empty, explain the missing market evidence or binding constraint. Passing a risk check, such as remaining below the daily loss limit, is eligibility to trade and is not evidence of a profitable opportunity.
-Respect whitelist, concurrent position slots, daily loss and min confidence. Closed positions release slots and can be replaced by new longs or shorts; there is no daily entry count limit. Do not add to existing positions. Shorts only when short_allowed. You own stop-loss and take-profit management; the system does not trail stops for you, so review every open position each run and tighten the stop or move the take profit when the evidence changes. stop_loss_pct is clamped to 2%-10% (default_atr_stop_pct in the snapshot is the 2.5 × ATR(14) 4h reference), and a stop can only be moved in the favorable direction, never loosened. Stops must sit on the loss side of the current price and take profits on the profit side. System sizes each position so a stop-out loses about risk_per_trade_pct of equity and lowers leverage per trade so the stop stays well ahead of liquidation. The exchange (futures) or the system (spot) executes the stop and take profit between runs. The daily loss check counts realized PnL plus open floating losses. Confidence must be finite and between 0 and 1."#;
+Respect whitelist, concurrent position slots, daily loss and min confidence. Closed positions release slots and can be replaced by new longs or shorts; there is no daily entry count limit. Do not add to existing positions. Shorts only when short_allowed. You own stop-loss and take-profit management: review every open position each run and tighten the stop or move the take profit when the evidence changes. Between runs the system only trails the stop at half the initial stop distance once price has moved one stop distance in favor, and it never loosens a stop you set. Every entry gets a take profit; if you omit take_profit_pct it defaults to twice the stop distance. Open positions in the same direction are capped by max_same_direction because the coins are correlated, and entries are paused after a drawdown or a losing streak (see risk_limits). Use recent_trades to learn from earlier results, and daily candles, funding_rate_pct and open_interest as context beyond the 4h chart. stop_loss_pct is clamped to 2%-10% (default_atr_stop_pct in the snapshot is the 2.5 × ATR(14) 4h reference), and a stop can only be moved in the favorable direction, never loosened. Stops must sit on the loss side of the current price and take profits on the profit side. System sizes each position so a stop-out loses about risk_per_trade_pct of equity and lowers leverage per trade so the stop stays well ahead of liquidation. The exchange hosts the stop (and take profit on futures); spot take profit is watched by the system. The daily loss check counts realized PnL plus open floating losses. Confidence must be finite and between 0 and 1."#;
 
 impl App {
     pub async fn snapshot(&self) -> Result<Value> {
@@ -18,6 +18,26 @@ impl App {
         let ex = self.exchange(&c);
         let held = self.store.open_trades()?;
         let (equity, _, pnl) = self.account_risk(&ex, &held).await?;
+        let peak = self.track_equity(equity)?;
+        let drawdown = if peak > 0.0 {
+            ((peak - equity) / peak * 100.0).max(0.0)
+        } else {
+            0.0
+        };
+        let mut recent: Vec<_> = self
+            .store
+            .trades()?
+            .into_iter()
+            .filter(|t| t.close_date.is_some())
+            .collect();
+        recent.sort_by(|a, b| b.close_date.cmp(&a.close_date));
+        let recent: Vec<_> = recent
+            .iter()
+            .take(10)
+            .map(|t| {
+                json!({"pair":t.pair,"side":if t.is_short{"short"}else{"long"},"opened_utc":t.open_date,"closed_utc":t.close_date,"profit_usdt":t.profit_abs,"profit_pct":t.profit_ratio*100.0,"exit_reason":t.exit_reason,"entry_tag":t.enter_tag})
+            })
+            .collect();
         let mut positions = vec![];
         let mut pairs = vec![];
         for t in &held {
@@ -52,17 +72,49 @@ impl App {
                     ])
                 })
                 .collect();
+            let daily = match ex.daily_candles(&c.market, p, 250).await {
+                Ok(ds) if ds.len() >= 30 => {
+                    let dx = indicators::calculate(&ds);
+                    let rows: Vec<_> = ds
+                        .iter()
+                        .zip(&dx)
+                        .skip(ds.len().saturating_sub(20))
+                        .map(|(c, x)| {
+                            json!([
+                                chrono::DateTime::from_timestamp_millis(c.time)
+                                    .unwrap()
+                                    .format("%Y-%m-%d")
+                                    .to_string(),
+                                c.open,
+                                c.high,
+                                c.low,
+                                c.close,
+                                c.volume,
+                                x.ema20,
+                                x.ema50,
+                                x.ema200,
+                                x.adx,
+                                x.rsi,
+                                x.atr
+                            ])
+                        })
+                        .collect();
+                    json!({"candles":rows})
+                }
+                _ => Value::Null,
+            };
+            let stats = ex.stats(&c.market, p).await.unwrap_or(Value::Null);
             let last = (cs.last(), xs.last());
             let stop = match last {
                 (Some(c), Some(x)) => stop_distance(x.atr, c.close),
                 _ => None,
             };
-            pairs.push(json!({"pair":p,"default_atr_stop_pct":stop.map(|d| d * 100.0),"columns":["date","open","high","low","close","volume","ema20","ema50","ema200","adx","rsi","atr"],"candles":rows}));
+            pairs.push(json!({"pair":p,"default_atr_stop_pct":stop.map(|d| d * 100.0),"columns":["date","open","high","low","close","volume","ema20","ema50","ema200","adx","rsi","atr"],"candles":rows,"daily_columns":["date","open","high","low","close","volume","ema20","ema50","ema200","adx","rsi","atr"],"daily":daily,"market_stats":stats}));
         }
         Ok(
             json!({"time_utc":now(),"exchange":"bybit","market":c.market,"timeframe":"4h","leverage":c.leverage,"short_allowed":c.market=="futures"&&c.short,"bot_state":if c.running{"running"}else{"stopped"},
             "account":{"equity_usdt":equity,"pnl_today_with_floating_loss_usdt":pnl,"pnl_today_with_floating_loss_pct":if equity-pnl>0.0{pnl/(equity-pnl)*100.0}else{0.0}},
-            "risk_limits":{"max_open":c.max_open,"slots_left":c.max_open.saturating_sub(held.len()),"max_daily_loss_pct":c.ai.max_daily_loss_pct,"min_confidence":c.ai.min_confidence,"risk_per_trade_pct":c.risk_per_trade_pct,"max_leverage":c.leverage},"open_positions":positions,"pairs":pairs}),
+            "risk_limits":{"max_open":c.max_open,"slots_left":c.max_open.saturating_sub(held.len()),"max_daily_loss_pct":c.ai.max_daily_loss_pct,"min_confidence":c.ai.min_confidence,"risk_per_trade_pct":c.risk_per_trade_pct,"max_leverage":c.leverage,"max_same_direction":c.max_same_direction,"max_drawdown_pct":c.ai.max_drawdown_pct,"max_consecutive_losses":c.ai.max_consecutive_losses,"drawdown_from_peak_pct":drawdown},"recent_trades":recent,"open_positions":positions,"pairs":pairs}),
         )
     }
     pub async fn execute_actions(&self, actions: &[Value], external: bool) -> Result<Vec<Value>> {
@@ -156,34 +208,30 @@ impl App {
             let snap = self.snapshot().await?;
             let (text, usage) = call_model(&c, &snap).await?;
             rec["usage"] = usage;
-            let text = text
-                .trim()
-                .trim_start_matches("```json")
-                .trim_start_matches("```")
-                .trim_end_matches("```")
-                .trim();
-            let response: Value = serde_json::from_str(text)?;
+            let response: Value = serde_json::from_str(extract_json(&text))?;
             ensure!(response["analysis"].is_string(), "模型缺少 analysis");
             let acts = response["actions"].as_array().context("模型缺少 actions")?;
             ensure!(acts.len() <= 24, "模型返回了过多动作");
-            for a in acts {
-                ensure!(
-                    matches!(
-                        a["action"].as_str(),
-                        Some("open_long" | "open_short" | "close" | "set_stops")
-                    ) && a["pair"].is_string()
-                        && a["confidence"]
-                            .as_f64()
-                            .is_some_and(|n| n.is_finite() && (0.0..=1.0).contains(&n)),
-                    "模型动作格式无效"
-                );
-            }
+            // One malformed action must not discard the whole run: keep the valid ones.
+            let (valid, invalid): (Vec<Value>, Vec<Value>) =
+                acts.iter().cloned().partition(valid_action);
+            let invalid: Vec<Value> = invalid
+                .into_iter()
+                .map(|mut a| {
+                    a["status"] = json!("invalid");
+                    a["note"] = json!("模型动作格式无效");
+                    a
+                })
+                .collect();
             rec["analysis"] = response["analysis"].clone();
-            rec["actions"] = if execute {
-                json!(self.execute_actions(acts, false).await?)
+            let mut done = if execute {
+                self.execute_actions(&valid, false).await?
             } else {
-                json!(acts)
+                valid
             };
+            done.extend(invalid);
+            rec["actions"] = json!(done);
+            rec["shadow"] = json!(!execute && source == "auto");
             Ok(())
         }
         .await;
@@ -203,6 +251,22 @@ impl App {
         }
         Ok(rec)
     }
+}
+/// The model sometimes wraps its JSON in prose or a code fence; take the outermost object.
+fn extract_json(text: &str) -> &str {
+    match (text.find('{'), text.rfind('}')) {
+        (Some(a), Some(b)) if a < b => &text[a..=b],
+        _ => text.trim(),
+    }
+}
+fn valid_action(a: &Value) -> bool {
+    matches!(
+        a["action"].as_str(),
+        Some("open_long" | "open_short" | "close" | "set_stops")
+    ) && a["pair"].is_string()
+        && a["confidence"]
+            .as_f64()
+            .is_some_and(|n| n.is_finite() && (0.0..=1.0).contains(&n))
 }
 /// An optional numeric field: absent or null is None, anything else must be a number.
 fn opt_num(a: &Value, key: &str) -> Result<Option<f64>> {
@@ -670,7 +734,7 @@ pub async fn scheduler(app: Arc<App>) {
             app.store
                 .set_state(key, &serde_json::to_string(&schedule)?)?;
             if due {
-                app.run_ai(true, "auto").await?;
+                app.run_ai(!c.ai.shadow, "auto").await?;
             }
             Ok(())
         }
@@ -1142,5 +1206,33 @@ mod schedule_tests {
         assert_eq!(next, 3780);
         assert!(!due);
         assert!(schedule_tick(3780, 60, 180, Some(&state)).unwrap().2);
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn json_is_found_inside_prose_and_bad_actions_are_separated() {
+        assert_eq!(extract_json("```json\n{\"a\":1}\n```"), "{\"a\":1}");
+        assert_eq!(
+            extract_json("好的。{\"a\":{\"b\":2}} 以上"),
+            "{\"a\":{\"b\":2}}"
+        );
+        assert_eq!(extract_json(" no json "), "no json");
+        assert!(valid_action(
+            &json!({"action":"set_stops","pair":"BTC/USDT","confidence":0.7})
+        ));
+        assert!(!valid_action(
+            &json!({"action":"buy","pair":"BTC/USDT","confidence":0.7})
+        ));
+        assert!(!valid_action(
+            &json!({"action":"close","pair":"BTC/USDT","confidence":1.5})
+        ));
+        assert!(!valid_action(&json!({"action":"close","confidence":0.5})));
+        assert!(opt_num(&json!({"x":null}), "x").unwrap().is_none());
+        assert_eq!(opt_num(&json!({"x":3.5}), "x").unwrap(), Some(3.5));
+        assert!(opt_num(&json!({"x":"3"}), "x").is_err());
     }
 }

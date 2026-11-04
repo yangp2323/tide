@@ -1,13 +1,22 @@
 use crate::{
     exchange::{category, quantize, symbol, Bybit, Fill},
     indicators,
-    model::{day, now, num, Config, Trade},
+    model::{day, now, num, AiConfig, Config, Trade},
     App,
 };
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+/// What backs a spot position's stop on the exchange.
+enum SpotStop {
+    /// A conditional order is resting on Bybit.
+    Hosted,
+    /// The conditional order fired and the trade was settled.
+    Settled,
+    /// None could be maintained; `tick` watches the price itself.
+    Absent,
+}
 // Keep the independently audited inputs explicit in this pure risk function.
 #[allow(clippy::too_many_arguments)]
 pub fn entry_guard(
@@ -28,6 +37,11 @@ pub fn entry_guard(
     );
     ensure!(held.len() < c.max_open, "已达到持仓上限");
     ensure!(!held.iter().any(|t| t.pair == pair), "这个交易对已有持仓");
+    ensure!(
+        c.max_same_direction == 0
+            || held.iter().filter(|t| t.is_short == short).count() < c.max_same_direction,
+        "同方向持仓已达上限"
+    );
     if ai {
         ensure!(c.ai.enabled, "AI 交易未开启");
         let start = equity - pnl;
@@ -131,20 +145,64 @@ pub fn check_new_stops(t: &Trade, price: f64, stop: Option<f64>, tp: Option<f64>
     }
     Ok(())
 }
+/// Safety net between AI runs: once price has moved one stop distance in favor, the stop trails
+/// the best price by half of it. Trades opened before ATR stops keep a fixed 6% / 3% rule.
+pub fn trail_params(t: &Trade) -> (f64, f64) {
+    if t.stop_dist > 0.0 {
+        (t.stop_dist, t.stop_dist / 2.0)
+    } else {
+        (0.06, 0.03)
+    }
+}
+/// New best price and stop. The stop only ever moves in the trade's favor, so it never undoes a
+/// tighter stop the AI chose.
+pub fn stop_price(t: &Trade, price: f64) -> (f64, f64) {
+    let (activate, trail) = trail_params(t);
+    let peak = if t.is_short {
+        t.peak.min(price)
+    } else {
+        t.peak.max(price)
+    };
+    let favorable = if t.is_short {
+        (t.open_rate - peak) / t.open_rate
+    } else {
+        (peak - t.open_rate) / t.open_rate
+    };
+    let stop = if favorable >= activate {
+        if t.is_short {
+            t.stop_loss_abs.min(peak * (1.0 + trail))
+        } else {
+            t.stop_loss_abs.max(peak * (1.0 - trail))
+        }
+    } else {
+        t.stop_loss_abs
+    };
+    (peak, stop)
+}
+/// Account-level circuit breakers: drawdown from the equity high-water mark, and a run of
+/// losing trades closed since the bot was last started. `recent` is newest first.
+pub fn breaker(c: &Config, recent: &[Trade], equity: f64, peak: f64) -> Result<()> {
+    let limit = c.ai.max_drawdown_pct;
+    if limit > 0.0 && peak > 0.0 && equity.is_finite() {
+        let drawdown = (peak - equity) / peak * 100.0;
+        ensure!(
+            drawdown < limit,
+            "账户回撤 {:.1}% 达到熔断线 {}%，暂停新开仓",
+            drawdown,
+            limit
+        );
+    }
+    let n = c.ai.max_consecutive_losses as usize;
+    ensure!(
+        n == 0 || recent.len() < n || !recent[..n].iter().all(|t| t.profit_abs < 0.0),
+        "连续亏损 {} 笔，暂停新开仓；检查后重新启动机器人即可恢复",
+        n
+    );
+    Ok(())
+}
 /// Today's PnL for the daily loss limit: realized today plus every open position's floating loss.
 pub fn daily_pnl(realized_today: f64, unrealized: &[f64]) -> f64 {
     realized_today + unrealized.iter().map(|u| u.min(0.0)).sum::<f64>()
-}
-pub fn realized(trades: &[Trade], today_only: bool) -> f64 {
-    trades
-        .iter()
-        .filter(|t| {
-            t.close_date
-                .as_ref()
-                .is_some_and(|s| !today_only || s.starts_with(&day()))
-        })
-        .map(|t| t.profit_abs)
-        .sum()
 }
 pub fn usdt(wallet: &Value) -> (f64, f64) {
     let coin = wallet["coin"]
@@ -188,7 +246,14 @@ impl App {
             t.entry_fee = fill.fee;
             let d = if t.stop_dist > 0.0 { t.stop_dist } else { 0.08 };
             t.stop_loss_abs = fill.price * if t.is_short { 1.0 + d } else { 1.0 - d };
-            self.store.insert_trade(t.clone(), link)?;
+            let saved = self.store.insert_trade(t.clone(), link)?;
+            self.store.log_stop(
+                saved.trade_id,
+                &saved.pair,
+                saved.stop_loss_abs,
+                saved.take_profit_abs,
+                "open",
+            );
             self.store.log(
                 "INFO",
                 &format!("开仓 {} {} @ {}", t.pair, t.amount, t.open_rate),
@@ -311,7 +376,7 @@ impl App {
             }
             unrealized.push(num(&t.mark(price)["profit_abs"]));
         }
-        let pnl = daily_pnl(realized(&self.store.trades()?, true), &unrealized);
+        let pnl = daily_pnl(self.store.realized_on(&day())?, &unrealized);
         Ok((equity, free, pnl))
     }
     pub async fn reconcile(&self, c: &Config) -> Result<()> {
@@ -382,6 +447,16 @@ impl App {
         );
         let ai = tag != "trend";
         entry_guard(&c, &held, pnl, equity, pair, short, confidence, ai)?;
+        let peak = self.track_equity(equity)?;
+        let since = self.store.state("breaker_since")?.unwrap_or_default();
+        breaker(
+            &c,
+            &self
+                .store
+                .closed_since(&since, c.ai.max_consecutive_losses as usize)?,
+            equity,
+            peak,
+        )?;
         let ins = ex.instrument(&c.market, pair).await?;
         let price = ex.price(&c.market, pair).await?;
         let used: f64 = held.iter().map(|t| t.stake_amount).sum();
@@ -402,11 +477,9 @@ impl App {
                 stop_distance(atr, price).context("ATR 无效，无法计算止损")?
             }
         };
-        let take_profit = stops
-            .take_profit_pct
-            .map(|pct| take_profit_from_pct(price, pct, short))
-            .transpose()?
-            .unwrap_or(0.0);
+        // Every entry gets a take profit; without an explicit one it is twice the stop distance.
+        let take_profit =
+            take_profit_from_pct(price, stops.take_profit_pct.unwrap_or(stop * 200.0), short)?;
         let leverage = if futures {
             trade_leverage(
                 leverage_cap(c.leverage, num(&ins["leverageFilter"]["maxLeverage"])),
@@ -572,6 +645,10 @@ impl App {
             "该交易对有待确认订单"
         );
         let ex = self.exchange(&c);
+        // The resting spot stop locks the coins; it has to go before the market sell.
+        if t.market == "spot" {
+            self.cancel_spot_stop(&ex, &t).await?;
+        }
         let ins = ex.instrument(&t.market, &t.pair).await?;
         let step = if t.market == "futures" {
             ins["lotSizeFilter"]["qtyStep"].as_str()
@@ -644,6 +721,13 @@ impl App {
         if t.market == "futures" {
             self.push_stops(&ex, &t).await?;
         }
+        self.store.log_stop(
+            t.trade_id,
+            &t.pair,
+            t.stop_loss_abs,
+            t.take_profit_abs,
+            "ai",
+        );
         self.store.log(
             "INFO",
             &format!(
@@ -665,6 +749,147 @@ impl App {
         };
         self.set_stop(ex, t, &quantize(t.stop_loss_abs, tick)?, &tp)
             .await
+    }
+    /// Keep a conditional market sell on Bybit at the trade's stop, so a spot position stays
+    /// protected while this process is down. Failures are logged and the price check in `tick`
+    /// remains as the fallback.
+    async fn sync_spot_stop(&self, ex: &Bybit, t: &Trade) -> SpotStop {
+        match self.try_spot_stop(ex, t).await {
+            Ok(state) => state,
+            Err(e) => {
+                self.store.log(
+                    "WARNING",
+                    &format!("{} 现货止损单维护失败，改由程序监控：{}", t.pair, e),
+                );
+                SpotStop::Absent
+            }
+        }
+    }
+    async fn try_spot_stop(&self, ex: &Bybit, t: &Trade) -> Result<SpotStop> {
+        let key = format!("spot_stop:{}", t.trade_id);
+        let ins = ex.instrument(&t.market, &t.pair).await?;
+        let tick_size = ins["priceFilter"]["tickSize"]
+            .as_str()
+            .context("缺少价格精度")?;
+        let step = ins["lotSizeFilter"]["basePrecision"]
+            .as_str()
+            .context("缺少下单精度")?;
+        let trigger = quantize(t.stop_loss_abs, tick_size)?;
+        if let Some(link) = self.store.state(&key)?.filter(|l| !l.is_empty()) {
+            match ex.lookup(&t.market, &t.pair, &link).await? {
+                Some(o) if matches!(o["orderStatus"].as_str(), Some("Untriggered" | "New")) => {
+                    if (num(&o["triggerPrice"]) - trigger.parse::<f64>()?).abs()
+                        > tick_size.parse::<f64>()? * 0.5
+                    {
+                        ex.post("/v5/order/amend",json!({"category":"spot","symbol":symbol(&t.pair),"orderLinkId":link,"triggerPrice":trigger})).await?;
+                    }
+                    return Ok(SpotStop::Hosted);
+                }
+                Some(_) => match ex.confirm(&t.market, &t.pair, &link).await? {
+                    // Triggered but not final yet: keep waiting, do not sell a second time.
+                    None => return Ok(SpotStop::Hosted),
+                    Some(fill) if fill.qty > 0.0 => {
+                        self.store.set_state(&key, "")?;
+                        let order = json!({"link":link,"action":"exit","data":{"trade":t,"reason":"stop_loss_on_exchange","request":{"qty":fill.qty},"qty_step":step}});
+                        self.settle(&order, fill).await?;
+                        return Ok(SpotStop::Settled);
+                    }
+                    Some(_) => self.store.set_state(&key, "")?,
+                },
+                None => self.store.set_state(&key, "")?,
+            }
+        }
+        let link = format!("s{}", uuid::Uuid::new_v4().simple());
+        let body = json!({"category":"spot","symbol":symbol(&t.pair),"side":"Sell","orderType":"Market","qty":quantize(t.amount,step)?,"marketUnit":"baseCoin","triggerPrice":trigger,"orderFilter":"StopOrder","orderLinkId":link});
+        // Remember the link first: a lost response must not leave an untracked order behind.
+        self.store.set_state(&key, &link)?;
+        if let Err(e) = ex.post("/v5/order/create", body).await {
+            if e.downcast_ref::<crate::exchange::Rejected>()
+                .is_some_and(|e| e.definitive())
+            {
+                self.store.set_state(&key, "")?;
+            }
+            return Err(e);
+        }
+        Ok(SpotStop::Hosted)
+    }
+    /// Remove the resting stop before the position is sold. A stop that has already fired is
+    /// left alone and the sale is refused until the system has settled it.
+    async fn cancel_spot_stop(&self, ex: &Bybit, t: &Trade) -> Result<()> {
+        let key = format!("spot_stop:{}", t.trade_id);
+        let Some(link) = self.store.state(&key)?.filter(|l| !l.is_empty()) else {
+            return Ok(());
+        };
+        match ex.lookup(&t.market, &t.pair, &link).await? {
+            None => {}
+            Some(o) => match o["orderStatus"].as_str().unwrap_or("") {
+                "Untriggered" | "New" => {
+                    ex.post(
+                        "/v5/order/cancel",
+                        json!({"category":"spot","symbol":symbol(&t.pair),"orderLinkId":link}),
+                    )
+                    .await?;
+                }
+                "Cancelled" | "Deactivated" | "Rejected" => {}
+                _ => bail!("{} 的止损单已触发，等待系统核对后再操作", t.pair),
+            },
+        }
+        self.store.set_state(&key, "")
+    }
+    /// Highest equity seen since the bot was last started.
+    pub fn track_equity(&self, equity: f64) -> Result<f64> {
+        let peak: f64 = self
+            .store
+            .state("equity_peak")?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        if equity.is_finite() && equity > peak {
+            self.store.set_state("equity_peak", &equity.to_string())?;
+            return Ok(equity);
+        }
+        Ok(peak)
+    }
+    /// Once a minute, pause the bot if equity has fallen past the drawdown limit. Existing
+    /// positions keep their stops.
+    async fn watchdog(&self, c: &Config, ex: &Bybit) -> Result<()> {
+        if !c.running || c.ai.max_drawdown_pct <= 0.0 {
+            return Ok(());
+        }
+        let nowts = chrono::Utc::now().timestamp();
+        let last: i64 = self
+            .store
+            .state("watchdog_at")?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if nowts - last < 60 {
+            return Ok(());
+        }
+        self.store.set_state("watchdog_at", &nowts.to_string())?;
+        let held = self.store.open_trades()?;
+        let (equity, _, _) = self.account_risk(ex, &held).await?;
+        let peak = self.track_equity(equity)?;
+        if let Err(e) = breaker(
+            &Config {
+                ai: AiConfig {
+                    max_consecutive_losses: 0,
+                    ..c.ai.clone()
+                },
+                ..c.clone()
+            },
+            &[],
+            equity,
+            peak,
+        ) {
+            let mut paused = self.store.config()?;
+            paused.running = false;
+            self.store.save_config(&paused)?;
+            self.store
+                .log("ERROR", &format!("熔断，机器人已暂停：{}", e));
+            let _ = self
+                .telegram(c, &format!("熔断，机器人已暂停：{}", e))
+                .await;
+        }
+        Ok(())
     }
     pub async fn sync_external_exit(&self, c: &Config, t: &Trade, ex: &Bybit) -> Result<bool> {
         let positions = ex.positions().await?;
@@ -802,7 +1027,7 @@ impl App {
         let ex = self.exchange(&c);
         // Risk exits continue while new entries are paused.
         let mut risk_errors = Vec::new();
-        for t in self.store.open_trades()? {
+        for mut t in self.store.open_trades()? {
             let result: Result<()> = async {
                 if self.store.unresolved()?.iter().any(|o| o["pair"] == t.pair) {
                     return Ok(());
@@ -810,10 +1035,42 @@ impl App {
                 if t.market == "futures" && self.sync_external_exit(&c, &t, &ex).await? {
                     return Ok(());
                 }
-                // Futures stops live on the exchange; only spot is watched here.
+                let spot_stop = if t.market == "spot" {
+                    match self.sync_spot_stop(&ex, &t).await {
+                        SpotStop::Settled => return Ok(()),
+                        state => Some(state),
+                    }
+                } else {
+                    None
+                };
+                let price = ex.price(&t.market, &t.pair).await?;
+                let (peak, stop) = stop_price(&t, price);
+                let previous = t.stop_loss_abs;
+                // Persist first: if the exchange update fails, the next sync_external_exit
+                // sees the difference and restores the stop from this record.
+                if peak != t.peak || stop != previous {
+                    t.peak = peak;
+                    t.stop_loss_abs = stop;
+                    self.store.update_trade(&t)?;
+                }
+                if stop != previous {
+                    self.store
+                        .log_stop(t.trade_id, &t.pair, stop, t.take_profit_abs, "trail");
+                    if t.market == "futures" {
+                        let ins = ex.instrument(&t.market, &t.pair).await?;
+                        let tick = ins["priceFilter"]["tickSize"]
+                            .as_str()
+                            .context("缺少价格精度")?;
+                        // Moves smaller than one tick round to the current stop; nothing to send.
+                        if quantize(stop, tick)? != quantize(previous, tick)? {
+                            self.push_stops(&ex, &t).await?;
+                        }
+                    }
+                }
                 if t.market == "spot" {
-                    let price = ex.price(&t.market, &t.pair).await?;
-                    let reason = if price <= t.stop_loss_abs {
+                    // A resting exchange stop does the stop-loss; the price check backs it up.
+                    let hosted = matches!(spot_stop, Some(SpotStop::Hosted));
+                    let reason = if !hosted && price <= t.stop_loss_abs {
                         Some("stop_loss")
                     } else if t.take_profit_abs > 0.0 && price >= t.take_profit_abs {
                         Some("take_profit")
@@ -830,6 +1087,9 @@ impl App {
             if let Err(e) = result {
                 risk_errors.push(e.to_string());
             }
+        }
+        if let Err(e) = self.watchdog(&c, &ex).await {
+            self.store.log("WARNING", &format!("回撤检查失败：{}", e));
         }
         self.store
             .set_state("risk_error", &risk_errors.join("；"))?;
@@ -963,6 +1223,97 @@ mod tests {
         assert!(check_new_stops(&t, 90.0, Some(106.0), None).is_err());
         assert!(check_new_stops(&t, 90.0, Some(89.0), None).is_err());
         assert!(check_new_stops(&t, 90.0, None, Some(95.0)).is_err());
+    }
+
+    fn sample(short: bool, profit: f64) -> Trade {
+        Trade {
+            trade_id: 1,
+            pair: "BTC/USDT".into(),
+            market: "spot".into(),
+            is_short: short,
+            leverage: 1,
+            amount: 1.0,
+            open_rate: 100.0,
+            stake_amount: 100.0,
+            open_date: now(),
+            close_rate: None,
+            close_date: None,
+            profit_abs: profit,
+            profit_ratio: 0.0,
+            stop_loss_abs: 95.0,
+            take_profit_abs: 0.0,
+            peak: 100.0,
+            enter_tag: "ai".into(),
+            exit_reason: None,
+            entry_fee: 0.0,
+            stop_dist: 0.05,
+            funding: 0.0,
+        }
+    }
+    #[test]
+    fn trailing_floor_never_loosens_a_stop() {
+        let t = sample(false, 0.0);
+        assert_eq!(stop_price(&t, 104.0), (104.0, 95.0));
+        let (peak, stop) = stop_price(&t, 110.0);
+        assert_eq!(peak, 110.0);
+        assert!((stop - 107.25).abs() < 1e-9);
+        // A tighter stop chosen by the AI stays when it is already above the trail.
+        let mut tight = sample(false, 0.0);
+        tight.stop_loss_abs = 109.0;
+        assert_eq!(stop_price(&tight, 110.0).1, 109.0);
+        let mut short = sample(true, 0.0);
+        short.stop_loss_abs = 105.0;
+        let (_, stop) = stop_price(&short, 90.0);
+        assert!((stop - 92.25).abs() < 1e-9);
+        let mut legacy = sample(false, 0.0);
+        legacy.stop_dist = 0.0;
+        legacy.stop_loss_abs = 92.0;
+        assert!((stop_price(&legacy, 106.0).1 - 102.82).abs() < 1e-9);
+    }
+
+    #[test]
+    fn breakers_stop_new_entries_after_drawdown_or_a_losing_streak() {
+        let mut c = Config::default();
+        c.ai.max_drawdown_pct = 20.0;
+        c.ai.max_consecutive_losses = 3;
+        assert!(breaker(&c, &[], 100.0, 100.0).is_ok());
+        assert!(breaker(&c, &[], 81.0, 100.0).is_ok());
+        assert!(breaker(&c, &[], 80.0, 100.0).is_err());
+        let loss = sample(false, -1.0);
+        let win = sample(false, 2.0);
+        assert!(breaker(&c, &[loss.clone(), loss.clone()], 100.0, 100.0).is_ok());
+        assert!(breaker(&c, &[loss.clone(), win.clone(), loss.clone()], 100.0, 100.0).is_ok());
+        assert!(breaker(
+            &c,
+            &[loss.clone(), loss.clone(), loss.clone()],
+            100.0,
+            100.0
+        )
+        .is_err());
+        c.ai.max_consecutive_losses = 0;
+        c.ai.max_drawdown_pct = 0.0;
+        assert!(breaker(&c, &[loss.clone(), loss.clone(), loss], 1.0, 100.0).is_ok());
+    }
+
+    #[test]
+    fn same_direction_positions_are_capped() {
+        let mut c = Config {
+            running: true,
+            pairs: vec!["A/USDT".into(), "B/USDT".into(), "C/USDT".into()],
+            market: "futures".into(),
+            short: true,
+            max_same_direction: 2,
+            ..Config::default()
+        };
+        let mut a = sample(false, 0.0);
+        a.pair = "A/USDT".into();
+        let mut b = sample(false, 0.0);
+        b.pair = "B/USDT".into();
+        let held = [a, b];
+        assert!(entry_guard(&c, &held, 0.0, 100.0, "C/USDT", false, None, false).is_err());
+        assert!(entry_guard(&c, &held, 0.0, 100.0, "C/USDT", true, None, false).is_ok());
+        c.max_same_direction = 0;
+        assert!(entry_guard(&c, &held, 0.0, 100.0, "C/USDT", false, None, false).is_ok());
     }
 
     #[test]

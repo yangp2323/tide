@@ -114,6 +114,7 @@ pub fn validate(c: &Config) -> Result<()> {
         c.risk_per_trade_pct.is_finite() && (0.1..=5.0).contains(&c.risk_per_trade_pct),
         "每笔风险在 0.1% 到 5% 之间"
     );
+    ensure!(c.max_same_direction <= 5, "同方向持仓上限在 0 到 5 之间");
     ensure!(
         c.capital.is_none_or(|v| v.is_finite() && v > 0.0),
         "资金上限必须是大于 0 的有效金额"
@@ -164,6 +165,7 @@ async fn handle(
             }
             "/api/ai/snapshot" => app.snapshot().await,
             "/api/ai/log" => Ok(json!(app.store.decisions(limit(q, 50, 500))?)),
+            "/api/stops" => app.store.stop_history(limit(q, 50, 500)),
             "/api/orders/pending" => Ok(json!(app.store.unresolved()?)),
             _ => bail!("接口不存在"),
         };
@@ -198,6 +200,10 @@ async fn handle(
             validate(&c)?;
             let ex = app.exchange(&c);
             ex.wallet().await?;
+            // A fresh start re-baselines the circuit breakers on today's equity.
+            let (equity, _, _) = app.account_risk(&ex, &app.store.open_trades()?).await?;
+            app.store.set_state("equity_peak", &equity.to_string())?;
+            app.store.set_state("breaker_since", &crate::model::now())?;
             c.running = true;
         }
         ("POST", "/api/bot/stop") => {
@@ -277,6 +283,9 @@ async fn handle(
             if let Some(r) = body.get("risk_per_trade_pct").filter(|v| !v.is_null()) {
                 new.risk_per_trade_pct = r.as_f64().context("每笔风险无效")?;
             }
+            if let Some(m) = body.get("max_same_direction").filter(|v| !v.is_null()) {
+                new.max_same_direction = m.as_u64().context("同方向持仓上限无效")? as usize;
+            }
             validate(&new)?;
             ensure!(
                 app.store.unresolved()?.is_empty(),
@@ -335,7 +344,9 @@ async fn handle(
             crate::ai::validate_model_options(&a)?;
             ensure!(
                 (0.0..=1.0).contains(&a.min_confidence)
-                    && (0.5..=50.0).contains(&a.max_daily_loss_pct),
+                    && (0.5..=50.0).contains(&a.max_daily_loss_pct)
+                    && (a.max_drawdown_pct == 0.0 || (1.0..=90.0).contains(&a.max_drawdown_pct))
+                    && a.max_consecutive_losses <= 50,
                 "AI 风控参数超出范围"
             );
             if !a.base_url.is_empty() {
@@ -487,7 +498,7 @@ pub async fn overview(app: &App) -> Result<Value> {
             json!({"date":day,"abs_profit":daily.get(&day).copied().unwrap_or(0.0)})
         })
         .collect();
-    let mut out = json!({"engine":"rust","server_ip":std::env::var("SERVER_IP").unwrap_or_default(),"key":mask(&c.exchange.key),"telegram":c.telegram.enabled,"capital":c.capital,"market":c.market,"leverage":c.leverage,"short":c.short,"pairs":c.pairs,"max_open":c.max_open,"max_pairs":12,"max_open_limit":5,"max_leverage":25,"risk_per_trade_pct":c.risk_per_trade_pct,"stop_rule":"2.5×ATR，2%–10%","ai":c.ai.enabled,"state":if c.running{"running"}else{"stopped"},"strategy":"AI","timeframe":"4h","open":[],"watch":[],"daily":days,"recent":closed.iter().take(5).collect::<Vec<_>>(),"profit":{"profit_closed_coin":profit,"profit_closed_ratio_mean":if closed.is_empty(){0.0}else{closed.iter().map(|t|t.profit_ratio).sum::<f64>()/closed.len() as f64},"closed_trade_count":closed.len(),"winning_trades":closed.iter().filter(|t|t.profit_abs>0.0).count(),"losing_trades":closed.iter().filter(|t|t.profit_abs<=0.0).count()}});
+    let mut out = json!({"engine":"rust","server_ip":std::env::var("SERVER_IP").unwrap_or_default(),"key":mask(&c.exchange.key),"telegram":c.telegram.enabled,"capital":c.capital,"market":c.market,"leverage":c.leverage,"short":c.short,"pairs":c.pairs,"max_open":c.max_open,"max_pairs":12,"max_open_limit":5,"max_leverage":25,"risk_per_trade_pct":c.risk_per_trade_pct,"max_same_direction":c.max_same_direction,"stop_rule":"AI 设置，2%–10%","ai":c.ai.enabled,"state":if c.running{"running"}else{"stopped"},"strategy":"AI","timeframe":"4h","open":[],"watch":[],"daily":days,"recent":closed.iter().take(5).collect::<Vec<_>>(),"profit":{"profit_closed_coin":profit,"profit_closed_ratio_mean":if closed.is_empty(){0.0}else{closed.iter().map(|t|t.profit_ratio).sum::<f64>()/closed.len() as f64},"closed_trade_count":closed.len(),"winning_trades":closed.iter().filter(|t|t.profit_abs>0.0).count(),"losing_trades":closed.iter().filter(|t|t.profit_abs<=0.0).count()}});
     let result:Result<()> =async {
         let ticks=ex.tickers(&c.market).await?;let mut open=vec![];for t in &held{let p=ticks["list"].as_array().and_then(|a|a.iter().find(|p|p["symbol"]==symbol(&t.pair))).context("持仓行情缺失")?;open.push(t.mark(num(&p["lastPrice"])));}
         out["open"]=json!(open);

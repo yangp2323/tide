@@ -21,6 +21,7 @@ impl Store {
           CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, time TEXT NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS decisions(id INTEGER PRIMARY KEY, data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
+        migrate_schema(&db)?;
         Ok(Self {
             dir: dir.into(),
             db: Mutex::new(db),
@@ -45,12 +46,59 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         data.iter().map(|s| Ok(serde_json::from_str(s)?)).collect()
     }
+    fn trades_where(&self, filter: &str, args: impl rusqlite::Params) -> Result<Vec<Trade>> {
+        let db = self.db.lock().unwrap();
+        let mut q = db.prepare(&format!(
+            "SELECT data FROM trades WHERE {} ORDER BY id DESC",
+            filter
+        ))?;
+        let data = q
+            .query_map(args, |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        data.iter().map(|s| Ok(serde_json::from_str(s)?)).collect()
+    }
     pub fn open_trades(&self) -> Result<Vec<Trade>> {
-        Ok(self
-            .trades()?
-            .into_iter()
-            .filter(|t| t.close_date.is_none())
-            .collect())
+        self.trades_where("json_extract(data,'$.close_date') IS NULL", [])
+    }
+    /// Trades closed after `since` ("YYYY-MM-DD HH:MM:SS"), newest first.
+    pub fn closed_since(&self, since: &str, limit: usize) -> Result<Vec<Trade>> {
+        let mut v = self.trades_where("json_extract(data,'$.close_date') > ?1", [since])?;
+        v.sort_by(|a, b| b.close_date.cmp(&a.close_date));
+        v.truncate(limit);
+        Ok(v)
+    }
+    /// Realized PnL of trades closed on the given UTC day ("YYYY-MM-DD").
+    pub fn realized_on(&self, day: &str) -> Result<f64> {
+        let db = self.db.lock().unwrap();
+        Ok(db.query_row(
+            "SELECT COALESCE(SUM(json_extract(data,'$.profit_abs')),0) FROM trades WHERE json_extract(data,'$.close_date') LIKE ?1",
+            [format!("{}%", day)],
+            |r| r.get(0),
+        )?)
+    }
+    pub fn log_stop(&self, trade_id: i64, pair: &str, stop: f64, tp: f64, source: &str) {
+        if let Ok(db) = self.db.lock() {
+            let _ = db.execute(
+                "INSERT INTO stop_changes(time,trade_id,pair,stop,take_profit,source) VALUES (?,?,?,?,?,?)",
+                params![now(), trade_id, pair, stop, tp, source],
+            );
+            let _ = db.execute(
+                "DELETE FROM stop_changes WHERE id <= (SELECT MAX(id) FROM stop_changes) - 5000",
+                [],
+            );
+        }
+    }
+    pub fn stop_history(&self, limit: usize) -> Result<Value> {
+        let db = self.db.lock().unwrap();
+        let mut q = db.prepare(
+            "SELECT time,trade_id,pair,stop,take_profit,source FROM stop_changes ORDER BY id DESC LIMIT ?",
+        )?;
+        let rows = q
+            .query_map([limit], |r| {
+                Ok(json!({"time":r.get::<_,String>(0)?,"trade_id":r.get::<_,i64>(1)?,"pair":r.get::<_,String>(2)?,"stop":r.get::<_,f64>(3)?,"take_profit":r.get::<_,f64>(4)?,"source":r.get::<_,String>(5)?}))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(json!(rows))
     }
     pub fn insert_trade(&self, mut t: Trade, link: &str) -> Result<Trade> {
         let mut db = self.db.lock().unwrap();
@@ -192,6 +240,22 @@ impl Store {
         )?;
         Ok(())
     }
+}
+/// Ordered schema upgrades, tracked with SQLite's user_version so a change never runs twice.
+fn migrate_schema(db: &Connection) -> Result<()> {
+    const STEPS: &[&str] = &[
+        "CREATE INDEX IF NOT EXISTS trades_close ON trades(json_extract(data,'$.close_date'))",
+        "CREATE TABLE IF NOT EXISTS stop_changes(id INTEGER PRIMARY KEY, time TEXT NOT NULL, trade_id INTEGER NOT NULL, pair TEXT NOT NULL, stop REAL NOT NULL, take_profit REAL NOT NULL, source TEXT NOT NULL)",
+    ];
+    let version: usize = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    for (i, sql) in STEPS.iter().enumerate().skip(version) {
+        db.execute_batch(&format!(
+            "BEGIN; {}; PRAGMA user_version={}; COMMIT;",
+            sql,
+            i + 1
+        ))?;
+    }
+    Ok(())
 }
 pub fn atomic_json(path: &Path, data: &impl serde::Serialize) -> Result<()> {
     let tmp = path.with_extension("tmp");

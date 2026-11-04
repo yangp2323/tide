@@ -12,6 +12,9 @@ pub struct Config {
     pub capital: Option<f64>,
     /// Maximum loss per trade at its stop, as a percentage of trading equity.
     pub risk_per_trade_pct: f64,
+    /// Most open positions in the same direction; 0 means no limit. Correlated
+    /// coins move together, so this caps how concentrated the book can be.
+    pub max_same_direction: usize,
     pub running: bool,
     pub ai: AiConfig,
     pub exchange: Credentials,
@@ -27,6 +30,7 @@ impl Default for Config {
             short: false,
             capital: None,
             risk_per_trade_pct: 1.0,
+            max_same_direction: 2,
             running: false,
             ai: AiConfig::default(),
             exchange: Credentials::default(),
@@ -67,6 +71,12 @@ pub struct AiConfig {
     pub delay_seconds: u32,
     pub min_confidence: f64,
     pub max_daily_loss_pct: f64,
+    /// Pause the bot when equity falls this far below its high-water mark; 0 disables it.
+    pub max_drawdown_pct: f64,
+    /// Block new entries after this many losing trades in a row; 0 disables it.
+    pub max_consecutive_losses: u32,
+    /// Analyse and record decisions on schedule without placing any order.
+    pub shadow: bool,
 }
 impl Default for AiConfig {
     fn default() -> Self {
@@ -86,6 +96,9 @@ impl Default for AiConfig {
             delay_seconds: 180,
             min_confidence: 0.6,
             max_daily_loss_pct: 5.0,
+            max_drawdown_pct: 20.0,
+            max_consecutive_losses: 5,
+            shadow: false,
         }
     }
 }

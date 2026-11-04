@@ -198,7 +198,45 @@ impl Bybit {
         limit: usize,
         end: Option<i64>,
     ) -> Result<Vec<Candle>> {
-        let mut args = json!({"category":category(market),"symbol":symbol(pair),"interval":interval.to_string(),"limit":limit.min(1000)});
+        self.klines(market, pair, &interval.to_string(), interval, limit, end)
+            .await
+    }
+    /// Closed daily candles (Bybit names that interval "D").
+    pub async fn daily_candles(
+        &self,
+        market: &str,
+        pair: &str,
+        limit: usize,
+    ) -> Result<Vec<Candle>> {
+        self.klines(market, pair, "D", 1440, limit, None).await
+    }
+    /// 24h change, turnover and, for perpetuals, funding rate and open interest.
+    pub async fn stats(&self, market: &str, pair: &str) -> Result<Value> {
+        let v = self
+            .get(
+                "/v5/market/tickers",
+                json!({"category":category(market),"symbol":symbol(pair)}),
+                false,
+            )
+            .await?;
+        let t = &v["list"][0];
+        let mut out = json!({"change_24h_pct":num(&t["price24hPcnt"])*100.0,"turnover_24h_usdt":num(&t["turnover24h"])});
+        if market == "futures" {
+            out["funding_rate_pct"] = json!(num(&t["fundingRate"]) * 100.0);
+            out["open_interest"] = json!(num(&t["openInterest"]));
+        }
+        Ok(out)
+    }
+    async fn klines(
+        &self,
+        market: &str,
+        pair: &str,
+        code: &str,
+        interval: u32,
+        limit: usize,
+        end: Option<i64>,
+    ) -> Result<Vec<Candle>> {
+        let mut args = json!({"category":category(market),"symbol":symbol(pair),"interval":code,"limit":limit.min(1000)});
         if let Some(end) = end {
             args["end"] = json!(end);
         }

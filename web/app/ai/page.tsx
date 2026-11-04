@@ -20,6 +20,9 @@ type Cfg = {
   delay_seconds: number;
   min_confidence: number;
   max_daily_loss_pct: number;
+  max_drawdown_pct: number;
+  max_consecutive_losses: number;
+  shadow: boolean;
   enabled: boolean;
 };
 
@@ -86,6 +89,9 @@ export default function AiPage() {
   const [delay, setDelay] = useState(180);
   const [conf, setConf] = useState(0.6);
   const [loss, setLoss] = useState(5);
+  const [drawdown, setDrawdown] = useState(20);
+  const [streak, setStreak] = useState(5);
+  const [shadow, setShadow] = useState(false);
 
   const fill = useCallback((c: Cfg) => {
     setProvider(c.provider);
@@ -101,6 +107,9 @@ export default function AiPage() {
     setDelay(c.delay_seconds ?? 180);
     setConf(c.min_confidence);
     setLoss(c.max_daily_loss_pct);
+    setDrawdown(c.max_drawdown_pct ?? 20);
+    setStreak(c.max_consecutive_losses ?? 5);
+    setShadow(!!c.shadow);
   }, []);
 
   const load = useCallback(async () => {
@@ -162,6 +171,9 @@ export default function AiPage() {
         delay_seconds: delay,
         min_confidence: conf,
         max_daily_loss_pct: loss,
+        max_drawdown_pct: drawdown,
+        max_consecutive_losses: streak,
+        shadow,
       });
       setApiKey("");
       await load();
@@ -209,7 +221,7 @@ export default function AiPage() {
       <div className="grid g2">
         <Card title="AI 交易" right={<StateLabel on={on}>{on ? "运行中" : "未开启"}</StateLabel>}>
           <p className="hint">
-            开启后，<b>所有自动开平仓都由大模型决定</b>，按设定间隔分析行情和持仓。止损（2%–10%）和止盈由大模型设置，之后只能收紧止损、不能放宽；每笔金额（按风险比例）和杠杆仍由系统按止损距离计算，大模型改不了。
+            开启后，<b>所有自动开平仓都由大模型决定</b>，按设定间隔分析行情和持仓。止损（2%–10%）和止盈由大模型设置，之后只能收紧止损、不能放宽；两次分析之间系统按止损距离的一半自动追踪止损，作为保底；每笔金额（按风险比例）和杠杆仍由系统按止损距离计算，大模型改不了。
           </p>
           <div className="risk" style={{ marginTop: 12 }}>
             <div>
@@ -382,7 +394,26 @@ export default function AiPage() {
                   </label>
                   <input id="aiLoss" type="number" step={0.5} min={0.5} max={50} value={loss} onChange={(e) => setLoss(+e.target.value)} />
                 </div>
+                <div>
+                  <label className="f" htmlFor="aiDrawdown">
+                    账户回撤达到 % 暂停机器人（0 = 不限）
+                  </label>
+                  <input id="aiDrawdown" type="number" step={1} min={0} max={90} value={drawdown} onChange={(e) => setDrawdown(+e.target.value)} />
+                </div>
+                <div>
+                  <label className="f" htmlFor="aiStreak">
+                    连续亏损 N 笔停止开仓（0 = 不限）
+                  </label>
+                  <input id="aiStreak" type="number" step={1} min={0} max={50} value={streak} onChange={(e) => setStreak(+e.target.value)} />
+                </div>
               </div>
+              <label className="toggle" style={{ marginTop: 12 }}>
+                <input type="checkbox" checked={shadow} onChange={(e) => setShadow(e.target.checked)} />
+                <span>影子模式</span>
+              </label>
+              <p className="hint">
+                开启后按计划分析并记录决策，但不下任何单，用来观察模型质量。回撤从机器人每次启动时的权益算起，触发后自动暂停；连续亏损只统计启动之后平掉的单，重新启动即可恢复。
+              </p>
               <div className="row">
                 <button onClick={saveCfg} disabled={busy === "save"}>
                   {busy === "save" ? "保存中…" : "保存"}

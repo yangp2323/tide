@@ -7,7 +7,7 @@ import { useOv } from "@/lib/store";
 import { Card, Empty, MsgBox, Skeleton, useAction } from "@/lib/ui";
 
 type Market = "spot" | "futures";
-type Draft = { market: Market; leverage: number; short: boolean; max_open: number; risk_per_trade_pct: number; pairs: string[] };
+type Draft = { market: Market; leverage: number; short: boolean; max_open: number; risk_per_trade_pct: number; max_same_direction: number; pairs: string[] };
 type Row = {
   pair: string;
   base: string;
@@ -38,9 +38,10 @@ export default function StrategyPage() {
       short: !!d.short,
       max_open: d.max_open ?? 3,
       risk_per_trade_pct: d.risk_per_trade_pct ?? 1,
+      max_same_direction: d.max_same_direction ?? 2,
       pairs: d.pairs ?? [],
     }),
-    [d.market, d.leverage, d.short, d.max_open, d.risk_per_trade_pct, d.pairs],
+    [d.market, d.leverage, d.short, d.max_open, d.risk_per_trade_pct, d.max_same_direction, d.pairs],
   );
 
   const savedRef = useRef(saved);
@@ -103,6 +104,7 @@ export default function StrategyPage() {
       next.max_open = clamp(next.max_open || 1, 1, maxOpen);
       next.leverage = clamp(next.leverage || 1, 1, maxLev);
       next.risk_per_trade_pct = clamp(Math.round((next.risk_per_trade_pct || 1) * 10) / 10, 0.1, 5);
+      next.max_same_direction = clamp(Math.round(next.max_same_direction ?? 2), 0, 5);
       return next;
     });
   }
@@ -121,6 +123,7 @@ export default function StrategyPage() {
     if (a.short !== b.short && b.market === "futures") out.push(b.short ? "开启做空" : "关闭做空");
     if (a.max_open !== b.max_open) out.push(`持仓 ${a.max_open} → ${b.max_open} 笔`);
     if (a.risk_per_trade_pct !== b.risk_per_trade_pct) out.push(`每笔风险 ${a.risk_per_trade_pct}% → ${b.risk_per_trade_pct}%`);
+    if (a.max_same_direction !== b.max_same_direction) out.push(`同方向持仓上限 ${a.max_same_direction || "不限"} → ${b.max_same_direction || "不限"}`);
     if (a.market === b.market) {
       const sa = new Set(a.pairs);
       const sb = new Set(b.pairs);
@@ -299,6 +302,24 @@ export default function StrategyPage() {
               </span>
             </div>
             <p>仓位按「每笔风险 ÷ 止损距离」计算：止损越宽，仓位越小，止损时亏损都约为总资金的这个比例。资金太少达不到交易所最低下单额时不会开仓。</p>
+            <div style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+              <span className="muted" style={{ fontSize: 13 }}>
+                同方向最多
+              </span>
+              <span className="stepper">
+                <button aria-label="减少" onClick={() => update({ max_same_direction: cur.max_same_direction - 1 })}>
+                  −
+                </button>
+                <output>{cur.max_same_direction || "不限"}</output>
+                <button aria-label="增加" onClick={() => update({ max_same_direction: cur.max_same_direction + 1 })}>
+                  +
+                </button>
+              </span>
+              <span className="muted" style={{ fontSize: 13 }}>
+                笔
+              </span>
+            </div>
+            <p>BTC、ETH 等币种走势高度相关，同向的几笔仓位其实接近一笔大仓位。限制同方向数量可以避免风险集中；0 表示不限。</p>
           </div>
         </div>
         {warn.length > 0 && (
