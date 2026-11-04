@@ -1,5 +1,5 @@
 use crate::{
-    engine::{stop_distance, Stops},
+    engine::{leverage_cap, min_order_notional, stop_distance, trade_leverage, Stops},
     indicators,
     model::{now, num, AiConfig, Config},
     App,
@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 const SYSTEM: &str = r#"You manage a Bybit crypto account. Your primary objective is to grow account equity through positive expected net profit over repeated trades, accounting for fees, slippage and funding costs where applicable. Actively seek evidence-backed long and short opportunities within the supplied risk limits. Evaluate entries, holding and exits by their expected future return; do not make breaking even on a position the objective. Do not force trades when the evidence does not support positive expected net profit, and do not invent unavailable cost estimates or imply guaranteed returns.
-Use only the supplied closed candles and account snapshot. Return only a JSON object {"analysis":"简体中文分析","actions":[{"action":"open_long|open_short|close|set_stops","pair":"exact pair from snapshot","confidence":0.0,"reason":"简体中文理由"}]}. For open_long/open_short also give stop_loss_pct and take_profit_pct (percent of entry price, e.g. 4.5). For set_stops on an open position give stop_loss_price and/or take_profit_price as absolute prices (take_profit_price 0 removes the take profit). Explain the opportunity or lack of opportunity using specific supplied trend, momentum, volatility and price signals, including the expected direction and what would invalidate the thesis. For each action, explain how it serves the net profit objective. When actions is empty, explain the missing market evidence or binding constraint. Passing a risk check, such as remaining below the daily loss limit, is eligibility to trade and is not evidence of a profitable opportunity.
-Respect whitelist, concurrent position slots, daily loss and min confidence. Closed positions release slots and can be replaced by new longs or shorts; there is no daily entry count limit. Do not add to existing positions. Shorts only when short_allowed. You own stop-loss and take-profit management: review every open position each run and tighten the stop or move the take profit when the evidence changes. Between runs the system only trails the stop at half the initial stop distance once price has moved one stop distance in favor, and it never loosens a stop you set. Every entry gets a take profit; if you omit take_profit_pct it defaults to twice the stop distance. Open positions in the same direction are capped by max_same_direction because the coins are correlated, and entries are paused after a drawdown or a losing streak (see risk_limits). Use recent_trades to learn from earlier results, and daily candles, funding_rate_pct and open_interest as context beyond the 4h chart. stop_loss_pct is clamped to 2%-10% (default_atr_stop_pct in the snapshot is the 2.5 × ATR(14) 4h reference), and a stop can only be moved in the favorable direction, never loosened. Stops must sit on the loss side of the current price and take profits on the profit side. System sizes each position so a stop-out loses about risk_per_trade_pct of equity and lowers leverage per trade so the stop stays well ahead of liquidation. The exchange hosts the stop (and take profit on futures); spot take profit is watched by the system. The daily loss check counts realized PnL plus open floating losses. Confidence must be finite and between 0 and 1."#;
+Use only the supplied closed candles and account snapshot. Return only a JSON object {"analysis":"简体中文分析","actions":[{"action":"open_long|open_short|close|set_stops","pair":"exact pair from snapshot","confidence":0.0,"reason":"简体中文理由"}]}. For open_long/open_short also give stop_loss_pct and take_profit_pct (percent of entry price, e.g. 4.5), risk_pct (percent of equity lost if the stop is hit, e.g. 0.8) and, on futures, leverage (integer). For set_stops on an open position give stop_loss_price and/or take_profit_price as absolute prices (take_profit_price 0 removes the take profit). Explain the opportunity or lack of opportunity using specific supplied trend, momentum, volatility and price signals, including the expected direction and what would invalidate the thesis. For each action, explain how it serves the net profit objective. When actions is empty, explain the missing market evidence or binding constraint. Passing a risk check, such as remaining below the daily loss limit, is eligibility to trade and is not evidence of a profitable opportunity.
+Respect whitelist, concurrent position slots, daily loss and min confidence. Closed positions release slots and can be replaced by new longs or shorts; there is no daily entry count limit. Do not add to existing positions. Shorts only when short_allowed. You own stop-loss and take-profit management: review every open position each run and tighten the stop or move the take profit when the evidence changes. Between runs the system only trails the stop at half the initial stop distance once price has moved one stop distance in favor, and it never loosens a stop you set. Every entry gets a take profit; if you omit take_profit_pct it defaults to twice the stop distance. Open positions in the same direction are capped by max_same_direction because the coins are correlated, and entries are paused after a drawdown or a losing streak (see risk_limits). Use recent_trades to learn from earlier results, and daily candles, funding_rate_pct and open_interest as context beyond the 4h chart. stop_loss_pct is clamped to 2%-10% (default_atr_stop_pct in the snapshot is the 2.5 × ATR(14) 4h reference), and a stop can only be moved in the favorable direction, never loosened. Stops must sit on the loss side of the current price and take profits on the profit side. You decide position size and leverage: risk_pct is capped by max_risk_per_trade_pct and defaults to that cap, leverage is capped by max_leverage, the symbol limit and a safety limit that keeps the stop well ahead of liquidation, and defaults to that safety limit. Size by conviction: risk less on marginal setups and more on strong ones, and prefer lower leverage unless the setup justifies it. Position value is equity × risk_pct ÷ stop distance, so a wider stop means a smaller position. Each pair's sizing block lists min_order_usdt and min_risk_pct_at_default_stop; if that exceeds max_risk_per_trade_pct the pair cannot be opened with the current equity, so do not propose it. The exchange hosts the stop (and take profit on futures); spot take profit is watched by the system. The daily loss check counts realized PnL plus open floating losses. Confidence must be finite and between 0 and 1."#;
 
 impl App {
     pub async fn snapshot(&self) -> Result<Value> {
@@ -109,12 +109,36 @@ impl App {
                 (Some(c), Some(x)) => stop_distance(x.atr, c.close),
                 _ => None,
             };
-            pairs.push(json!({"pair":p,"default_atr_stop_pct":stop.map(|d| d * 100.0),"columns":["date","open","high","low","close","volume","ema20","ema50","ema200","adx","rsi","atr"],"candles":rows,"daily_columns":["date","open","high","low","close","volume","ema20","ema50","ema200","adx","rsi","atr"],"daily":daily,"market_stats":stats}));
+            // What the exchange minimum means for this account: the least notional that can be
+            // ordered, the risk that needs at the default stop, and the leverage limits.
+            let sizing = match (ex.instrument(&c.market, p).await, cs.last()) {
+                (Ok(ins), Some(last)) => {
+                    let futures = c.market == "futures";
+                    let min_order = min_order_notional(&ins, futures, last.close);
+                    let base = c.capital.map_or(equity, |cap| cap.min(equity));
+                    let max_lev = if futures {
+                        leverage_cap(c.leverage, num(&ins["leverageFilter"]["maxLeverage"]))
+                    } else {
+                        1
+                    };
+                    json!({
+                        "min_order_usdt":min_order,
+                        "min_risk_pct_at_default_stop":match (min_order, stop) {
+                            (Some(m), Some(d)) if base > 0.0 => json!(m * d / base * 100.0),
+                            _ => Value::Null,
+                        },
+                        "max_leverage_for_symbol":max_lev,
+                        "safe_leverage_at_default_stop":stop.map(|d| trade_leverage(max_lev, d)),
+                    })
+                }
+                _ => json!({}),
+            };
+            pairs.push(json!({"pair":p,"sizing":sizing,"default_atr_stop_pct":stop.map(|d| d * 100.0),"columns":["date","open","high","low","close","volume","ema20","ema50","ema200","adx","rsi","atr"],"candles":rows,"daily_columns":["date","open","high","low","close","volume","ema20","ema50","ema200","adx","rsi","atr"],"daily":daily,"market_stats":stats}));
         }
         Ok(
             json!({"time_utc":now(),"exchange":"bybit","market":c.market,"timeframe":"4h","leverage":c.leverage,"short_allowed":c.market=="futures"&&c.short,"bot_state":if c.running{"running"}else{"stopped"},
             "account":{"equity_usdt":equity,"pnl_today_with_floating_loss_usdt":pnl,"pnl_today_with_floating_loss_pct":if equity-pnl>0.0{pnl/(equity-pnl)*100.0}else{0.0}},
-            "risk_limits":{"max_open":c.max_open,"slots_left":c.max_open.saturating_sub(held.len()),"max_daily_loss_pct":c.ai.max_daily_loss_pct,"min_confidence":c.ai.min_confidence,"risk_per_trade_pct":c.risk_per_trade_pct,"max_leverage":c.leverage,"max_same_direction":c.max_same_direction,"max_drawdown_pct":c.ai.max_drawdown_pct,"max_consecutive_losses":c.ai.max_consecutive_losses,"drawdown_from_peak_pct":drawdown},"recent_trades":recent,"open_positions":positions,"pairs":pairs}),
+            "risk_limits":{"max_open":c.max_open,"slots_left":c.max_open.saturating_sub(held.len()),"max_daily_loss_pct":c.ai.max_daily_loss_pct,"min_confidence":c.ai.min_confidence,"max_risk_per_trade_pct":c.risk_per_trade_pct,"max_leverage":c.leverage,"max_same_direction":c.max_same_direction,"max_drawdown_pct":c.ai.max_drawdown_pct,"max_consecutive_losses":c.ai.max_consecutive_losses,"drawdown_from_peak_pct":drawdown},"recent_trades":recent,"open_positions":positions,"pairs":pairs}),
         )
     }
     pub async fn execute_actions(&self, actions: &[Value], external: bool) -> Result<Vec<Value>> {
@@ -163,21 +187,18 @@ impl App {
                 } else {
                     Some(a["confidence"].as_f64().unwrap_or(f64::NAN))
                 };
-                match (opt_num(&a, "stop_loss_pct"), opt_num(&a, "take_profit_pct")) {
-                    (Ok(stop_pct), Ok(take_profit_pct)) => {
+                match parse_stops(&a) {
+                    Ok(stops) => {
                         self.open_position(
                             &canonical,
                             action == "open_short",
                             "ai",
                             confidence,
-                            Stops {
-                                stop_pct,
-                                take_profit_pct,
-                            },
+                            stops,
                         )
                         .await
                     }
-                    (Err(e), _) | (_, Err(e)) => Err(e),
+                    Err(e) => Err(e),
                 }
             } else {
                 Err(anyhow::anyhow!("未知 action"))
@@ -267,6 +288,24 @@ fn valid_action(a: &Value) -> bool {
         && a["confidence"]
             .as_f64()
             .is_some_and(|n| n.is_finite() && (0.0..=1.0).contains(&n))
+}
+fn parse_stops(a: &Value) -> Result<Stops> {
+    let leverage = match opt_num(a, "leverage")? {
+        None => None,
+        Some(l) => {
+            ensure!(
+                l.fract() == 0.0 && (1.0..=1000.0).contains(&l),
+                "杠杆必须是不小于 1 的整数"
+            );
+            Some(l as u32)
+        }
+    };
+    Ok(Stops {
+        stop_pct: opt_num(a, "stop_loss_pct")?,
+        take_profit_pct: opt_num(a, "take_profit_pct")?,
+        risk_pct: opt_num(a, "risk_pct")?,
+        leverage,
+    })
 }
 /// An optional numeric field: absent or null is None, anything else must be a number.
 fn opt_num(a: &Value, key: &str) -> Result<Option<f64>> {

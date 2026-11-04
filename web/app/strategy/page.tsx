@@ -152,7 +152,7 @@ export default function StrategyPage() {
     if ((fut && cur.leverage >= 5) || cur.risk_per_trade_pct > 2) {
       const ok = await confirm({
         title: cur.risk_per_trade_pct > 2 ? `确定每笔承担 ${cur.risk_per_trade_pct}% 风险？` : `确定用最高 ${cur.leverage} 倍杠杆？`,
-        body: `每次止损约亏总资金的 ${cur.risk_per_trade_pct}%（不含费用和滑点），${cur.max_open} 笔同时止损约亏 ${(cur.risk_per_trade_pct * cur.max_open).toFixed(1)}%。杠杆只影响占用的保证金，系统会按止损距离逐笔下调，保证止损先于强平。`,
+        body: `每次止损最多约亏总资金的 ${cur.risk_per_trade_pct}%（不含费用和滑点，AI 可以选更小），${cur.max_open} 笔同时止损最多约亏 ${(cur.risk_per_trade_pct * cur.max_open).toFixed(1)}%。杠杆只影响占用的保证金，AI 在上限内选择，系统还会按止损距离下调，保证止损先于强平。`,
         ok: "确定",
         danger: true,
       });
@@ -190,7 +190,7 @@ export default function StrategyPage() {
 
   const warn: string[] = [];
   if (cur.risk_per_trade_pct * cur.max_open > 6)
-    warn.push(`${cur.max_open} 笔同时止损约亏总资金的 ${(cur.risk_per_trade_pct * cur.max_open).toFixed(1)}%，超过一般建议的 6%。`);
+    warn.push(`${cur.max_open} 笔同时止损最多约亏总资金的 ${(cur.risk_per_trade_pct * cur.max_open).toFixed(1)}%，超过一般建议的 6%。`);
   if (fut && cur.leverage >= 5)
     warn.push(`跳空或滑点可能让止损成交价比触发价更差；杠杆越高，留给止损的空间越小。`);
   const ch = changes();
@@ -223,7 +223,7 @@ export default function StrategyPage() {
             <div className="lev-top">
               <b>{cur.leverage}×</b>
               <span>
-                {!fut ? "现货没有杠杆" : cur.leverage === 1 ? "不加杠杆" : "上限，系统按止损距离逐笔下调"}
+                {!fut ? "现货没有杠杆" : cur.leverage === 1 ? "不加杠杆" : "上限，AI 在此范围内选择，系统按止损距离再下调"}
               </span>
             </div>
             <input
@@ -301,7 +301,7 @@ export default function StrategyPage() {
                 总资金
               </span>
             </div>
-            <p>仓位按「每笔风险 ÷ 止损距离」计算：止损越宽，仓位越小，止损时亏损都约为总资金的这个比例。资金太少达不到交易所最低下单额时不会开仓。</p>
+            <p>这是上限：AI 每次开仓自己决定实际风险（不超过这里）和杠杆（不超过上面的最高杠杆），系统按「风险 ÷ 止损距离」算出仓位，止损越宽仓位越小。资金太少、按这个上限算出的仓位达不到交易所最低下单额时不会开仓，快照里会告诉 AI 每个币的最小下单额。</p>
             <div style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
               <span className="muted" style={{ fontSize: 13 }}>
                 同方向最多

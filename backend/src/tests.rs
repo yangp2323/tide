@@ -711,6 +711,71 @@ async fn futures_stops_follow_ai_trail_and_external_take_profit() {
 }
 
 #[tokio::test]
+async fn ai_chooses_risk_and_leverage_within_the_limits() {
+    let _env = EXCHANGE.lock().await;
+    let sim = Arc::new(Mutex::new(Sim {
+        futures: true,
+        price: 10.0,
+        ..Sim::default()
+    }));
+    let cfg = model::Config {
+        market: "futures".into(),
+        pairs: vec!["BTC/USDT:USDT".into()],
+        leverage: 5,
+        short: true,
+        ..model::Config::default()
+    };
+    let (app, dir, server) = sim_app(&sim, cfg).await;
+    // 0.6% risk at a 4% stop is 150 notional: 75 margin at 2x.
+    let mut action = open_long("BTC/USDT:USDT");
+    action["risk_pct"] = json!(0.6);
+    action["leverage"] = json!(2);
+    let result = app.execute_actions(&[action], false).await.unwrap();
+    assert_eq!(result[0]["status"], "executed", "{}", result[0]);
+    let t = app.store.open_trades().unwrap().remove(0);
+    assert_eq!(t.leverage, 2);
+    assert!((t.amount - 15.0).abs() < 1e-9, "{}", t.amount);
+    {
+        let _lock = app.gate.lock().await;
+        app.close_position(t.trade_id, "force_exit").await.unwrap();
+    }
+    // Asking for more than the limits allows is lowered to them, not refused:
+    // risk to the 1% cap, leverage to the configured 5x.
+    let mut action = open_long("BTC/USDT:USDT");
+    action["risk_pct"] = json!(9.0);
+    action["leverage"] = json!(50);
+    let result = app.execute_actions(&[action], false).await.unwrap();
+    assert_eq!(result[0]["status"], "executed", "{}", result[0]);
+    let t = app.store.open_trades().unwrap().remove(0);
+    assert_eq!(t.leverage, 5);
+    assert!((t.amount - 25.0).abs() < 1e-9, "{}", t.amount);
+    {
+        let _lock = app.gate.lock().await;
+        app.close_position(t.trade_id, "force_exit").await.unwrap();
+    }
+    // Nonsense values are rejected before any order is sent.
+    let orders = sim.lock().await.count;
+    for bad in [
+        json!({"leverage":2.5}),
+        json!({"leverage":0}),
+        json!({"risk_pct":-1}),
+        json!({"risk_pct":"1"}),
+    ] {
+        let mut action = open_long("BTC/USDT:USDT");
+        for (k, v) in bad.as_object().unwrap() {
+            action[k] = v.clone();
+        }
+        let result = app.execute_actions(&[action], false).await.unwrap();
+        assert_eq!(result[0]["status"], "failed", "{}", result[0]);
+    }
+    assert_eq!(sim.lock().await.count, orders);
+    server.abort();
+    std::env::remove_var("BYBIT_BASE_URL");
+    drop(app);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn spot_stop_rests_on_the_exchange_and_is_cancelled_before_a_sale() {
     let _env = EXCHANGE.lock().await;
     let sim = Arc::new(Mutex::new(Sim {

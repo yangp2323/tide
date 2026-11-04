@@ -104,6 +104,30 @@ pub fn risk_stake(equity: f64, risk_pct: f64, stop: f64, leverage: u32) -> f64 {
 pub struct Stops {
     pub stop_pct: Option<f64>,
     pub take_profit_pct: Option<f64>,
+    /// Percent of equity lost if the stop is hit; capped by the configured per-trade risk.
+    pub risk_pct: Option<f64>,
+    /// Requested leverage; lowered to the symbol limit and to what keeps the stop ahead of liquidation.
+    pub leverage: Option<u32>,
+}
+/// Smallest tradable order value in USDT: the exchange minimum rounded up to a whole quantity step.
+pub fn min_order_notional(ins: &Value, futures: bool, price: f64) -> Option<f64> {
+    let filter = &ins["lotSizeFilter"];
+    let step: f64 = filter[if futures { "qtyStep" } else { "basePrecision" }]
+        .as_str()?
+        .parse()
+        .ok()?;
+    if !(step.is_finite() && step > 0.0 && price.is_finite() && price > 0.0) {
+        return None;
+    }
+    let min_value = num(&filter[if futures {
+        "minNotionalValue"
+    } else {
+        "minOrderAmt"
+    }]);
+    let min_qty = (min_value / price)
+        .max(num(&filter["minOrderQty"]))
+        .max(step);
+    Some((min_qty / step).ceil() * step * price)
 }
 /// An AI-chosen stop distance is kept between 2% and 10% so leverage can still keep it ahead of liquidation.
 pub fn requested_stop(pct: f64) -> Result<f64> {
@@ -489,12 +513,20 @@ impl App {
         let take_profit =
             take_profit_from_pct(price, stops.take_profit_pct.unwrap_or(stop * 200.0), short)?;
         let leverage = if futures {
-            trade_leverage(
+            let allowed = trade_leverage(
                 leverage_cap(c.leverage, num(&ins["leverageFilter"]["maxLeverage"])),
                 stop,
-            )
+            );
+            stops.leverage.map_or(allowed, |l| l.clamp(1, allowed))
         } else {
             1
+        };
+        let risk_pct = match stops.risk_pct {
+            Some(r) => {
+                ensure!(r.is_finite() && r > 0.0, "风险百分比无效");
+                r.min(c.risk_per_trade_pct)
+            }
+            None => c.risk_per_trade_pct,
         };
         if futures {
             let account = ex.get("/v5/account/info", json!({}), true).await?;
@@ -545,19 +577,19 @@ impl App {
             "交易所价格或下单精度无效"
         );
         // Round the exchange minimum up to a tradable quantity before allocating slots.
-        let min_qty = (min_notional / price)
-            .max(num(&ins["lotSizeFilter"]["minOrderQty"]))
-            .max(qty_step);
-        let min_stake = (min_qty / qty_step).ceil() * qty_step * price / leverage as f64;
+        let min_stake = min_order_notional(&ins, futures, price)
+            .context("交易所价格或下单精度无效")?
+            / leverage as f64;
         let cap = entry_stake(budget, c.max_open - held.len(), min_stake)
             .context("可用预算预留 5% 后不足该交易对的最小下单要求")?;
         let base = c.capital.map_or(equity, |cap| cap.min(equity));
-        let wanted = risk_stake(base, c.risk_per_trade_pct, stop, leverage);
+        let wanted = risk_stake(base, risk_pct, stop, leverage);
         ensure!(
             wanted.is_finite() && wanted >= min_stake,
-            "按每笔 {}% 风险、{:.1}% 止损计算的仓位低于交易所最小下单额",
-            c.risk_per_trade_pct,
-            stop * 100.0
+            "按每笔 {}% 风险、{:.1}% 止损、{} 倍杠杆计算的仓位低于交易所最小下单额",
+            risk_pct,
+            stop * 100.0,
+            leverage
         );
         let stake = wanted.min(cap);
         let qty = quantize(stake * leverage as f64 / price, step)?;
@@ -1317,6 +1349,18 @@ mod tests {
         c.ai.max_consecutive_losses = 0;
         c.ai.max_drawdown_pct = 0.0;
         assert!(breaker(&c, &[loss.clone(), loss.clone(), loss], 1.0, 100.0).is_ok());
+    }
+
+    #[test]
+    fn minimum_order_is_rounded_up_to_a_whole_step() {
+        let ins = json!({"lotSizeFilter":{"qtyStep":"0.001","minNotionalValue":"5","minOrderQty":"0.001"}});
+        // 5 USDT is only 0.0000653 BTC, so the 0.001 BTC minimum quantity decides.
+        assert!((min_order_notional(&ins, true, 76455.0).unwrap() - 76.455).abs() < 1e-6);
+        let cheap =
+            json!({"lotSizeFilter":{"qtyStep":"0.1","minNotionalValue":"5","minOrderQty":"0.1"}});
+        assert!((min_order_notional(&cheap, true, 3.7).unwrap() - 5.18).abs() < 1e-9);
+        assert!(min_order_notional(&json!({}), true, 1.0).is_none());
+        assert!(min_order_notional(&ins, true, 0.0).is_none());
     }
 
     #[test]
