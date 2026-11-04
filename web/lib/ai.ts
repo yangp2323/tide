@@ -29,6 +29,7 @@ export type Cfg = {
   interval: number;
   delay_seconds: number;
   min_confidence: number;
+  daily_profit_target_pct: number;
   max_daily_loss_pct: number;
   max_drawdown_pct: number;
   max_consecutive_losses: number;

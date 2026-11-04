@@ -830,6 +830,29 @@ async fn futures_stops_follow_ai_trail_and_external_take_profit() {
     assert_eq!(snap["pairs"][0]["forming_4h_candle"]["high_so_far"], 10.4);
     assert_eq!(snap["pairs"][0]["forming_4h_candle"]["last"], 10.2);
     assert_eq!(snap["account"]["available_usdt"], 1000.0);
+    // Account-level loss limits belong to the system; the model is not shown them.
+    let text = snap.to_string();
+    for hidden in [
+        "pnl_today",
+        "max_daily_loss_pct",
+        "max_drawdown_pct",
+        "max_consecutive_losses",
+        "drawdown_from_peak_pct",
+        "risk_limits",
+    ] {
+        assert!(!text.contains(hidden), "{hidden}");
+    }
+    assert!(snap["trade_limits"]["max_risk_per_trade_pct"].is_number());
+    assert!(snap["daily_profit_target"].is_null());
+    let mut config = app.store.config().unwrap();
+    config.ai.daily_profit_target_pct = 2.0;
+    app.store.save_config(&config).unwrap();
+    let target = app.snapshot().await.unwrap()["daily_profit_target"].clone();
+    assert_eq!(target["target_pct"], 2.0);
+    assert!(target["target_usdt"].as_f64().unwrap() > 0.0);
+    assert!(target["earned_today_usdt"].as_f64().unwrap() >= 0.0);
+    config.ai.daily_profit_target_pct = 0.0;
+    app.store.save_config(&config).unwrap();
     // The exchange's own view is sent live: the bot's position is flagged as its own and a
     // position and an order the operator placed by hand are shown as theirs.
     {

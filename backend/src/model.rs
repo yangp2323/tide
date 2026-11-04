@@ -75,6 +75,8 @@ pub struct AiConfig {
     pub interval: u32,
     pub delay_seconds: u32,
     pub min_confidence: f64,
+    /// Profit goal for each UTC day, as a percent of that day's starting equity; 0 disables it.
+    pub daily_profit_target_pct: f64,
     pub max_daily_loss_pct: f64,
     /// Pause the bot when equity falls this far below its high-water mark; 0 disables it.
     pub max_drawdown_pct: f64,
@@ -228,6 +230,7 @@ impl Default for AiConfig {
             interval: 240,
             delay_seconds: 180,
             min_confidence: 0.6,
+            daily_profit_target_pct: 0.0,
             max_daily_loss_pct: 5.0,
             max_drawdown_pct: 20.0,
             max_consecutive_losses: 5,

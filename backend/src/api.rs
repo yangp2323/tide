@@ -458,6 +458,7 @@ async fn handle(
             );
             ensure!(
                 (0.0..=1.0).contains(&a.min_confidence)
+                    && (0.0..=100.0).contains(&a.daily_profit_target_pct)
                     && (0.5..=50.0).contains(&a.max_daily_loss_pct)
                     && (a.max_drawdown_pct == 0.0 || (1.0..=90.0).contains(&a.max_drawdown_pct))
                     && a.max_consecutive_losses <= 50,

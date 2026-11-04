@@ -27,7 +27,7 @@ export default function StrategyPage() {
   const { confirm } = useFeedback();
   const { busy, msg, setMsg, run } = useAction();
   const riskAction = useAction();
-  const [risk, setRisk] = useState<{ min_confidence: number; max_daily_loss_pct: number; max_drawdown_pct: number; max_consecutive_losses: number } | null>(null);
+  const [risk, setRisk] = useState<{ min_confidence: number; daily_profit_target_pct: number; max_daily_loss_pct: number; max_drawdown_pct: number; max_consecutive_losses: number } | null>(null);
 
   const [draft, setDraft] = useState<Draft | null>(null);
   const [mk, setMk] = useState<Record<string, Row[]>>({});
@@ -63,6 +63,7 @@ export default function StrategyPage() {
         const c = r.config;
         setRisk({
           min_confidence: c.min_confidence,
+          daily_profit_target_pct: c.daily_profit_target_pct ?? 0,
           max_daily_loss_pct: c.max_daily_loss_pct,
           max_drawdown_pct: c.max_drawdown_pct ?? 20,
           max_consecutive_losses: c.max_consecutive_losses ?? 5,
@@ -301,6 +302,13 @@ export default function StrategyPage() {
                   最低置信度（低于不执行）
                 </label>
                 <input id="rkConf" type="number" step={0.05} min={0} max={1} value={risk.min_confidence} onChange={(e) => setRisk({ ...risk, min_confidence: +e.target.value })} />
+              </div>
+              <div>
+                <label className="f" htmlFor="rkTarget">
+                  每日盈利目标 %（0 = 不设）
+                </label>
+                <input id="rkTarget" type="number" step={0.5} min={0} max={100} value={risk.daily_profit_target_pct} onChange={(e) => setRisk({ ...risk, daily_profit_target_pct: +e.target.value })} />
+                <p className="hint">占当日起始权益（UTC）的比例，写进 AI 提示词作为当天目标。只是目标，系统不会因此强制开仓，达到后也不停止。</p>
               </div>
               <div>
                 <label className="f" htmlFor="rkLoss">
