@@ -127,15 +127,39 @@
   .msg:empty { display: none; }
   .steps { margin: 0; padding-left: 18px; color: var(--muted); font-size: 13px; }
   .steps b { color: var(--ink); }
-  .ai-log { border-top: 1px solid var(--soft); padding: 12px 0; }
-  .ai-log:first-child { border-top: 0; padding-top: 0; }
-  .ai-log .meta { font: 12px var(--mono); color: var(--muted); display: flex; gap: 10px; flex-wrap: wrap; }
-  .ai-log p { margin: 6px 0; font-size: 13px; white-space: pre-line; }
-  .ai-act { font-size: 13px; margin: 4px 0 0 2px; }
-  .ai-act .st { font: 600 11px/1 var(--cjk); padding: 3px 6px; border-radius: 5px; margin-right: 6px; }
-  .ai-act .st.executed { background: var(--up-soft); color: var(--up); }
-  .ai-act .st.blocked, .ai-act .st.failed { background: var(--down-soft); color: var(--down); }
-  .ai-act .st.idea { background: var(--soft); color: var(--muted); }
+  .calls { display: grid; gap: 10px; }
+  .call { border: 1px solid var(--line); border-left: 4px solid var(--line); border-radius: 10px; padding: 12px 14px; background: var(--card, #fff); }
+  .call.ok { border-left-color: var(--up); }
+  .call.bad { border-left-color: var(--down); }
+  .call.warn { border-left-color: var(--amber); }
+  .call.idea { border-left-color: #6b8fb5; }
+  .call.idle { border-left-color: var(--line); padding: 8px 14px; background: transparent; }
+  .call .head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+  .call .when { font: 600 13px var(--mono); }
+  .call .tag { font: 600 11px/1 var(--cjk); padding: 3px 7px; border-radius: 5px; background: var(--soft); color: var(--muted); }
+  .call .tag.src-hook { background: #fff3d6; color: #8a5a00; }
+  .call .tag.src-manual { background: #e3eefb; color: #2a5a8f; }
+  .call .tag.src-review { background: #efe6fb; color: #5b3a8f; }
+  .call .res { font-size: 13px; font-weight: 600; }
+  .call .res.ok { color: var(--up); }
+  .call .res.bad { color: var(--down); }
+  .call .res.warn { color: #8a5a00; }
+  .call .res.idea { color: #2a5a8f; }
+  .call .res.idle { color: var(--muted); font-weight: 400; }
+  .call .why { font-size: 12px; color: var(--muted); flex-basis: 100%; }
+  .call .msg { margin: 8px 0 0; }
+  .call .act { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; font-size: 13px; margin-top: 8px; }
+  .call .act .st { font: 600 11px/1 var(--cjk); padding: 3px 6px; border-radius: 5px; }
+  .call .act .st.executed { background: var(--up-soft); color: var(--up); }
+  .call .act .st.blocked, .call .act .st.failed { background: var(--down-soft); color: var(--down); }
+  .call .act .st.idea { background: var(--soft); color: var(--muted); }
+  .call .act .conf { font-size: 12px; color: var(--muted); }
+  .call .act .sub { font-size: 12px; color: var(--muted); flex-basis: 100%; line-height: 1.6; }
+  .call .more { margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .call .more summary { cursor: pointer; width: fit-content; }
+  .call .more p { margin: 6px 0 0; font-size: 12px; line-height: 1.7; white-space: pre-line; }
+  .call .tech { margin-top: 8px; font: 11px var(--mono); color: var(--muted); opacity: .75; }
+  .call.idle .tech { margin-top: 4px; }
   select { font: inherit; font-size: 14px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff; width: 100%; }
   .state { font-size: 12px; font-weight: 600; color: var(--faint); }
   .state.ok { color: var(--up); }

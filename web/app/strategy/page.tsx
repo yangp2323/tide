@@ -4,6 +4,7 @@ import { useFeedback } from "@/components/Feedback";
 import { api, post } from "@/lib/api";
 import { base, price, sign, vol } from "@/lib/fmt";
 import { useOv } from "@/lib/store";
+import AiControls from "@/components/AiControls";
 import { Card, Empty, MsgBox, Skeleton, useAction } from "@/lib/ui";
 
 type Market = "spot" | "futures";
@@ -205,6 +206,7 @@ export default function StrategyPage() {
   const ch = changes();
   return (
     <>
+      <AiControls />
       <Card title="交易策略" note="市场、杠杆、方向和仓位的上限 · 4 小时行情">
         <div className="fields">
           <div className="field">
@@ -278,7 +280,7 @@ export default function StrategyPage() {
                 <b>{riskCap}% 总资金</b>
               </div>
             </div>
-            <p>AI 看到每个币的最小下单额，资金不够的币不会提出开仓。当日亏损、回撤和连续亏损这些账户级保护在「AI 交易」页设置，触发后会停止开仓。</p>
+            <p>AI 看到每个币的最小下单额，资金不够的币不会提出开仓。当日亏损、回撤和连续亏损这些账户级保护在本页的风控保护里设置，触发后会停止开仓。</p>
           </div>
         </div>
         {warn.length > 0 && (

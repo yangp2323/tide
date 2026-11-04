@@ -188,7 +188,7 @@ export default function ModelPage() {
                     新增渠道
                   </button>
                 </div>
-                <p className="hint">下面的接口、模型和 Key 属于当前选中的渠道；分析间隔、风控等设置所有渠道共用，在「AI 交易」「交易策略」页设置。分析只用“使用中”的渠道，不会自动切换。</p>
+                <p className="hint">下面的接口、模型和 Key 属于当前选中的渠道；分析间隔、风控等设置所有渠道共用，在「交易策略」页设置。分析只用“使用中”的渠道，不会自动切换。</p>
                 <label className="f" htmlFor="aiChannelName">渠道名称</label>
                 <input id="aiChannelName" value={chName} maxLength={40} onChange={(e) => setChName(e.target.value)} />
               </div>

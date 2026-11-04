@@ -32,7 +32,7 @@ const TRADE: Item[] = [
 const SETUP: Item[] = [
   { href: "/strategy/", label: "交易策略", icon: IconStrategy },
   { href: "/knowledge/", label: "知识库", icon: IconKnowledge },
-  { href: "/ai/", label: "AI 交易", icon: IconAi },
+  { href: "/ai/", label: "决策记录", icon: IconAi },
   { href: "/model/", label: "大模型", icon: IconModel },
   { href: "/account/", label: "账户与资金", icon: IconAccount },
   { href: "/notify/", label: "通知", icon: IconNotify },
@@ -91,12 +91,12 @@ export function Shell({ children }: { children: React.ReactNode }) {
   const navLink = (it: Item) => {
     const on = norm(it.href) === path;
     const badge =
-      it.href === "/positions/" ? (openCount || 0) : it.href === "/ai/" && d.ai ? 1 : 0;
+      it.href === "/positions/" ? (openCount || 0) : it.href === "/strategy/" && d.ai ? 1 : 0;
     return (
       <Link key={it.href} href={it.href} className={"nav-a" + (on ? " on" : "")} aria-current={on ? "page" : undefined}>
         <it.icon />
         {it.label}
-        {badge > 0 && <span className="badge">{it.href === "/ai/" ? "开" : badge}</span>}
+        {badge > 0 && <span className="badge">{it.href === "/strategy/" ? "开" : badge}</span>}
       </Link>
     );
   };
