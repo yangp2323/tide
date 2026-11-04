@@ -1,0 +1,48 @@
+export type Channel = {
+  id: string;
+  name: string;
+  provider: string;
+  api_protocol: string;
+  reasoning_effort: string;
+  claude_thinking: string;
+  claude_effort: string;
+  claude_thinking_budget: number;
+  stream: boolean;
+  model: string;
+  base_url: string;
+  api_key: string | null;
+};
+
+export type Cfg = {
+  channels: Channel[];
+  active_channel: string;
+  provider: string;
+  api_protocol: string;
+  reasoning_effort: string;
+  claude_thinking: string;
+  claude_effort: string;
+  claude_thinking_budget: number;
+  stream: boolean;
+  model: string;
+  base_url: string;
+  api_key: string | null;
+  interval: number;
+  delay_seconds: number;
+  min_confidence: number;
+  max_daily_loss_pct: number;
+  max_drawdown_pct: number;
+  max_consecutive_losses: number;
+  shadow: boolean;
+  review: boolean;
+  enabled: boolean;
+};
+
+export type AiData = {
+  config: Cfg;
+  state: { running: boolean; last_run: string | null; next_run: string | null; last_error: string | null };
+  position_count: number;
+  max_open: number;
+  log: any[];
+};
+
+export const DEFAULT_MODEL: Record<string, string> = { anthropic: "claude-opus-5-5", openai: "deepseek-chat" };

@@ -25,6 +25,8 @@ export default function StrategyPage() {
   const { d, loaded } = useOv();
   const { confirm } = useFeedback();
   const { busy, msg, setMsg, run } = useAction();
+  const riskAction = useAction();
+  const [risk, setRisk] = useState<{ min_confidence: number; max_daily_loss_pct: number; max_drawdown_pct: number; max_consecutive_losses: number } | null>(null);
 
   const [draft, setDraft] = useState<Draft | null>(null);
   const [mk, setMk] = useState<Record<string, Row[]>>({});
@@ -53,6 +55,28 @@ export default function StrategyPage() {
   const stopLo = 0.02;
   const stopHi = 0.1;
   const levFor = (stop: number) => Math.max(1, Math.min(cur.leverage, Math.floor(0.6 / stop + 1e-9)));
+
+  useEffect(() => {
+    api<any>("/api/ai")
+      .then((r) => {
+        const c = r.config;
+        setRisk({
+          min_confidence: c.min_confidence,
+          max_daily_loss_pct: c.max_daily_loss_pct,
+          max_drawdown_pct: c.max_drawdown_pct ?? 20,
+          max_consecutive_losses: c.max_consecutive_losses ?? 5,
+        });
+      })
+      .catch(() => {});
+  }, []);
+
+  async function saveRisk() {
+    if (!risk) return;
+    await riskAction.run("risk", async () => {
+      await post("/api/ai/config", risk);
+      return { kind: "good", text: "已保存，下一轮分析起生效。" };
+    });
+  }
 
   const loadingMk = useRef<Set<string>>(new Set());
 
@@ -181,7 +205,7 @@ export default function StrategyPage() {
   const ch = changes();
   return (
     <>
-      <Card title="交易配置" note="AI 交易 · 4 小时行情 · AI 设置止盈止损">
+      <Card title="交易策略" note="市场、杠杆、方向和仓位的上限 · 4 小时行情">
         <div className="fields">
           <div className="field">
             <b>市场</b>
@@ -261,6 +285,50 @@ export default function StrategyPage() {
           <div className="msg warn" style={{ marginTop: 14 }}>
             {warn.join("\n")}
           </div>
+        )}
+      </Card>
+
+      <Card title="风控保护" note="账户级的安全线，触发后停止开仓" className="ai-settings">
+        {!risk ? (
+          <Skeleton lines={3} />
+        ) : (
+          <>
+            <div className="ai-fields">
+              <div>
+                <label className="f" htmlFor="rkConf">
+                  最低置信度（低于不执行）
+                </label>
+                <input id="rkConf" type="number" step={0.05} min={0} max={1} value={risk.min_confidence} onChange={(e) => setRisk({ ...risk, min_confidence: +e.target.value })} />
+              </div>
+              <div>
+                <label className="f" htmlFor="rkLoss">
+                  当日亏损达到 % 停止开仓
+                </label>
+                <input id="rkLoss" type="number" step={0.5} min={0.5} max={50} value={risk.max_daily_loss_pct} onChange={(e) => setRisk({ ...risk, max_daily_loss_pct: +e.target.value })} />
+                <p className="hint">已实现亏损加上持仓的浮亏，占当日起始权益的比例。</p>
+              </div>
+              <div>
+                <label className="f" htmlFor="rkDrawdown">
+                  账户回撤达到 % 暂停机器人（0 = 不限）
+                </label>
+                <input id="rkDrawdown" type="number" step={1} min={0} max={90} value={risk.max_drawdown_pct} onChange={(e) => setRisk({ ...risk, max_drawdown_pct: +e.target.value })} />
+                <p className="hint">从机器人每次启动时的权益算起，触发后自动暂停，已有仓位的止损仍然执行。</p>
+              </div>
+              <div>
+                <label className="f" htmlFor="rkStreak">
+                  连续亏损 N 笔停止开仓（0 = 不限）
+                </label>
+                <input id="rkStreak" type="number" step={1} min={0} max={50} value={risk.max_consecutive_losses} onChange={(e) => setRisk({ ...risk, max_consecutive_losses: +e.target.value })} />
+                <p className="hint">只统计机器人启动之后平掉的单，重新启动即可恢复。</p>
+              </div>
+            </div>
+            <div className="row">
+              <button onClick={saveRisk} disabled={riskAction.busy === "risk"}>
+                {riskAction.busy === "risk" ? "保存中…" : "保存"}
+              </button>
+            </div>
+            <MsgBox m={riskAction.msg} />
+          </>
         )}
       </Card>
 

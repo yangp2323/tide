@@ -69,6 +69,13 @@ export const IconLogs = () => (
   </svg>
 );
 
+export const IconModel = () => (
+  <svg {...S}>
+    <rect x="5" y="5" width="10" height="10" rx="2" />
+    <path d="M8 2v3M12 2v3M8 15v3M12 15v3M2 8h3M2 12h3M15 8h3M15 12h3" />
+  </svg>
+);
+
 export const IconKnowledge = () => (
   <svg {...S}>
     <path d="M4 4.5A1.5 1.5 0 0 1 5.5 3H16v13H5.5A1.5 1.5 0 0 0 4 17.5z" />
