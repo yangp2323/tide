@@ -225,7 +225,7 @@ async fn handle(
             "/api/ai" => {
                 let c = app.store.config()?;
                 Ok(
-                    json!({"config":ai_public(&c.ai),"state":app.ai_state.lock().await.clone(),"position_count":app.store.open_trades()?.len(),"max_open":c.max_open,"log":app.store.decisions(20)?}),
+                    json!({"config":ai_public(&c.ai),"state":app.ai_state.lock().await.clone(),"watches":app.watch_list()?.watches,"position_count":app.store.open_trades()?.len(),"max_open":c.max_open,"log":app.store.decisions(20)?}),
                 )
             }
             "/api/ai/snapshot" => app.snapshot().await,
@@ -449,6 +449,7 @@ async fn handle(
             validate_channel(&a, &a.channels[idx])?;
             a.normalize();
             crate::ai::validate_schedule(a.interval, a.delay_seconds)?;
+            crate::ai::validate_ai_schedule(&a.schedule_mode, a.ai_min_minutes, a.ai_max_minutes)?;
             let h = &a.hooks;
             ensure!(
                 (h.big_move_pct == 0.0 || (0.5..=20.0).contains(&h.big_move_pct))

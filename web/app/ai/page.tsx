@@ -1,7 +1,7 @@
 "use client";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/api";
-import { AiData, HOOK_LABEL, UsageDay } from "@/lib/ai";
+import { AiData, HOOK_LABEL, UsageDay, watchText } from "@/lib/ai";
 import { AI_ACT, AI_SOURCE, AI_STATUS, base, utc } from "@/lib/fmt";
 import { Card, Empty, Skeleton } from "@/lib/ui";
 
@@ -29,7 +29,11 @@ function outcome(r: any): { kind: Kind; label: string } {
 
 function trigger(r: any) {
   return (r.trigger?.events || [])
-    .map((e: any) => `${HOOK_LABEL[e.type] || e.type}${e.pair ? " " + base(e.pair) : ""}${e.message ? "：" + String(e.message).slice(0, 40) : ""}`)
+    .map((e: any) =>
+      e.type === "ai_watch" && e.condition
+        ? `${HOOK_LABEL.ai_watch}：${watchText(e.condition)}`
+        : `${HOOK_LABEL[e.type] || e.type}${e.pair ? " " + base(e.pair) : ""}${e.message ? "：" + String(e.message).slice(0, 40) : ""}`,
+    )
     .join("；");
 }
 
@@ -68,6 +72,30 @@ function DecisionRow({ r }: { r: any }) {
             {a.reason}
             {a.note ? `（${a.note}）` : ""}
           </span>
+        </div>
+      ))}
+      {r.next_run ? (
+        <div className="act">
+          <span className="st idea">下次</span>
+          <b>{r.next_run.minutes} 分钟后</b>
+          <span className="sub">
+            {r.next_run.reason}
+            {r.next_run.requested_minutes != null && Math.round(r.next_run.requested_minutes) !== r.next_run.minutes ? `（AI 要的是 ${r.next_run.requested_minutes} 分钟，已按范围调整）` : ""}
+          </span>
+        </div>
+      ) : null}
+      {(r.watches || []).map((w: any, i: number) => (
+        <div className="act" key={`w${i}`}>
+          <span className="st idea">条件</span>
+          <b>{watchText(w)}</b>
+          <span className="sub">{w.note}</span>
+        </div>
+      ))}
+      {(r.watches_rejected || []).map((w: any, i: number) => (
+        <div className="act" key={`x${i}`}>
+          <span className="st failed">条件被拒</span>
+          <b>{watchText(w)}</b>
+          <span className="sub">{w.rejected_because}</span>
         </div>
       ))}
       {detail ? (

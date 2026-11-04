@@ -28,6 +28,9 @@ export type Cfg = {
   api_key: string | null;
   interval: number;
   delay_seconds: number;
+  schedule_mode: "fixed" | "ai";
+  ai_min_minutes: number;
+  ai_max_minutes: number;
   min_confidence: number;
   daily_profit_target_pct: number;
   max_daily_loss_pct: number;
@@ -57,11 +60,36 @@ export const HOOK_LABEL: Record<string, string> = {
   position_closed: "仓位被止损/止盈平掉",
   big_move: "价格大幅波动",
   webhook: "外部 Webhook",
+  ai_watch: "AI 自设条件",
 };
+
+export type Watch = {
+  type: string;
+  pair: string;
+  price: number;
+  interval?: string;
+  note: string;
+  set_utc?: string;
+  expires_utc?: string;
+};
+
+const WATCH_KIND: Record<string, string> = {
+  price_above: "现价涨到",
+  price_below: "现价跌到",
+  close_above: "收盘高于",
+  close_below: "收盘低于",
+};
+
+/** One AI-set condition in words, e.g. "ETH 1h 收盘高于 2450". */
+export function watchText(w: Watch) {
+  const coin = (w.pair || "").split("/")[0];
+  return `${coin}${w.interval ? " " + w.interval : ""} ${WATCH_KIND[w.type] || w.type} ${w.price}`;
+}
 
 export type AiData = {
   config: Cfg;
-  state: { running: boolean; last_run: string | null; next_run: string | null; last_error: string | null };
+  state: { running: boolean; last_run: string | null; next_run: string | null; next_reason?: string | null; last_error: string | null };
+  watches?: Watch[];
   position_count: number;
   max_open: number;
   log: any[];

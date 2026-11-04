@@ -1634,3 +1634,238 @@ async fn queued_events_start_one_run_within_the_limits() {
     drop(app);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn in_ai_mode_the_model_sets_its_next_run_and_its_own_wake_ups() {
+    let _env = EXCHANGE.lock().await;
+    // Requests the model received, and the reply it gives (null makes it fail).
+    type Seen = Arc<Mutex<(Vec<Value>, Value)>>;
+    let seen: Seen = Arc::new(Mutex::new((vec![], Value::Null)));
+    async fn model(State(seen): State<Seen>, body: axum::Json<Value>) -> axum::response::Response {
+        let mut s = seen.lock().await;
+        s.0.push(body.0);
+        if s.1.is_null() {
+            return (axum::http::StatusCode::BAD_GATEWAY, "down").into_response();
+        }
+        axum::Json(json!({"choices":[{"finish_reason":"stop","message":{"content":s.1.to_string()}}],"usage":{"completion_tokens":9}})).into_response()
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let model_server = tokio::spawn(
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/v1/chat/completions", axum::routing::post(model))
+                .with_state(seen.clone()),
+        )
+        .into_future(),
+    );
+    let sim = Arc::new(Mutex::new(Sim {
+        price: 10.0,
+        ..Sim::default()
+    }));
+    let mut cfg = model::Config {
+        pairs: vec!["BTC/USDT".into()],
+        ..model::Config::default()
+    };
+    cfg.ai.provider = "openai".into();
+    cfg.ai.model = "m".into();
+    cfg.ai.api_key = "k".into();
+    cfg.ai.base_url = format!("http://{}/v1", addr);
+    cfg.ai.interval = 10;
+    cfg.ai.schedule_mode = "ai".into();
+    cfg.ai.hooks.enabled = false;
+    let (app, dir, server) = sim_app(&sim, cfg).await;
+    let last_user = || async {
+        let s = seen.lock().await;
+        let body = s.0.last().unwrap().clone();
+        serde_json::from_str::<Value>(
+            body["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .split_once("Snapshot:\n")
+                .unwrap()
+                .1,
+        )
+        .unwrap()
+    };
+    let now = || chrono::Utc::now().timestamp();
+
+    // A failed run leaves the fallback time, so the next attempt waits instead of retrying.
+    let rec = app.run_ai(true, "auto").await.unwrap();
+    assert!(!rec["error"].is_null());
+    let fallback = app.next_run().unwrap().unwrap();
+    assert_eq!(fallback.applied_minutes, 10);
+    assert!((fallback.at - now() - 600).abs() < 5);
+
+    seen.lock().await.1 = json!({"analysis":"等收盘","memory":"","actions":[],
+        "next_run_minutes":45,"next_run_reason":"等 1 小时收盘",
+        "watches":[
+            {"type":"price_above","pair":"BTC/USDT","price":10.5,"note":"突破再看"},
+            {"type":"price_below","pair":"BTC/USDT","price":10.5,"note":"方向写反"},
+            {"type":"close_below","pair":"BTC/USDT","price":10.01,"interval":"15m","note":"跌破就放弃"}]});
+    let rec = app.run_ai(true, "auto").await.unwrap();
+    assert!(rec["error"].is_null(), "{}", rec);
+    // The model is told the bounds it may choose within.
+    let snap = last_user().await;
+    assert_eq!(snap["schedule"]["min_minutes"], 5);
+    assert_eq!(snap["schedule"]["max_minutes"], 240);
+    assert_eq!(snap["active_watches"]["watches"], json!([]));
+    let next = app.next_run().unwrap().unwrap();
+    assert_eq!(
+        (next.applied_minutes, next.reason.as_str()),
+        (45, "等 1 小时收盘")
+    );
+    assert_eq!(rec["next_run"]["minutes"], 45);
+    let list = app.watch_list().unwrap();
+    assert_eq!(list.watches.len(), 2);
+    assert_eq!(list.rejected.len(), 1);
+    assert_eq!(rec["watches"].as_array().unwrap().len(), 2);
+    assert!(rec["watches_rejected"][0]["rejected_because"]
+        .as_str()
+        .unwrap()
+        .contains("低于现价"));
+
+    // A preview changes neither the time nor the watches.
+    seen.lock().await.1 =
+        json!({"analysis":"预览","memory":"","actions":[],"next_run_minutes":5,"watches":[]});
+    app.run_ai(false, "manual").await.unwrap();
+    assert_eq!(app.next_run().unwrap().unwrap(), next);
+    assert_eq!(app.watch_list().unwrap().watches.len(), 2);
+    let snap = last_user().await;
+    assert_eq!(snap["trigger"]["type"], "manual");
+    assert_eq!(
+        snap["active_watches"]["watches"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(snap["schedule"]["previous_plan"]["reason"], "等 1 小时收盘");
+    assert!(snap["active_watches"]["rejected_last_run"][0]["rejected_because"].is_string());
+    // The last real run is shown with its plan.
+    let previous = &snap["previous_runs"][0];
+    assert_eq!(previous["next_run"]["minutes"], 45);
+    assert_eq!(previous["watches_set"].as_array().unwrap().len(), 2);
+
+    // The price reaching a level wakes the AI once, even with the built-in hooks off.
+    let ids: Vec<_> = app
+        .watch_list()
+        .unwrap()
+        .watches
+        .iter()
+        .map(|w| w.id.clone())
+        .collect();
+    let prices = HashMap::from([("BTC/USDT".to_string(), 10.2)]);
+    app.check_watches(&prices, now()).await.unwrap();
+    assert!(app.hooks.lock().unwrap().pending.is_empty());
+    let prices = HashMap::from([("BTC/USDT".to_string(), 10.6)]);
+    app.check_watches(&prices, now()).await.unwrap();
+    let pending = app.hooks.lock().unwrap().pending.clone();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0]["type"], "ai_watch");
+    assert_eq!(pending[0]["condition"]["note"], "突破再看");
+    let left = app.watch_list().unwrap().watches;
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].id, ids[1]);
+    // Before any 15m candle has closed since the watch was set, the close condition waits.
+    app.check_watches(&HashMap::new(), left[0].set_at)
+        .await
+        .unwrap();
+    assert_eq!(app.hooks.lock().unwrap().pending.len(), 1);
+    assert_eq!(app.watch_list().unwrap().watches[0].checked_close, 0);
+
+    // The woken run sees the condition and its note; a watch it does not repeat is cancelled.
+    // The minimum gap since the last run is cleared so the event can start now.
+    app.hooks.lock().unwrap().last_run = 0;
+    seen.lock().await.1 = json!({"analysis":"条件触发","memory":"","actions":[],"next_run_minutes":120,"next_run_reason":"无事","watches":[]});
+    let rec = app.dispatch_hooks().await.unwrap().unwrap();
+    assert!(rec["error"].is_null(), "{}", rec);
+    let snap = last_user().await;
+    assert_eq!(snap["trigger"]["events"][0]["type"], "ai_watch");
+    assert!(app.watch_list().unwrap().watches.is_empty());
+    assert_eq!(app.next_run().unwrap().unwrap().applied_minutes, 120);
+    // Leaving the key out keeps the current list.
+    seen.lock().await.1 = json!({"analysis":"a","memory":"","actions":[],"next_run_minutes":30,
+        "watches":[{"type":"price_below","pair":"BTC/USDT","price":9,"note":"n"}]});
+    app.run_ai(true, "auto").await.unwrap();
+    seen.lock().await.1 = json!({"analysis":"b","memory":"","actions":[],"next_run_minutes":30});
+    app.run_ai(true, "auto").await.unwrap();
+    assert_eq!(app.watch_list().unwrap().watches.len(), 1);
+    assert!(app.watch_list().unwrap().rejected.is_empty());
+    // An expired watch is dropped without waking anyone.
+    let expires = app.watch_list().unwrap().watches[0].expires_at;
+    app.check_watches(&HashMap::from([("BTC/USDT".to_string(), 8.0)]), expires)
+        .await
+        .unwrap();
+    assert!(app.watch_list().unwrap().watches.is_empty());
+    assert!(app.hooks.lock().unwrap().pending.is_empty());
+
+    // Back in fixed mode nothing of this reaches the model or wakes it.
+    let mut c = app.store.config().unwrap();
+    c.ai.schedule_mode = "fixed".into();
+    app.store.save_config(&c).unwrap();
+    app.push_hook(json!({"type":"ai_watch","pair":"BTC/USDT"}));
+    assert!(app.hooks.lock().unwrap().pending.is_empty());
+    let before = app.next_run().unwrap();
+    app.run_ai(true, "auto").await.unwrap();
+    let snap = last_user().await;
+    assert!(snap["schedule"].is_null() && snap["active_watches"].is_null());
+    assert_eq!(snap["trigger"]["interval_minutes"], 10);
+    assert_eq!(app.next_run().unwrap(), before);
+    model_server.abort();
+    server.abort();
+    std::env::remove_var("BYBIT_BASE_URL");
+    drop(app);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_close_condition_reads_the_candle_that_closed() {
+    let _env = EXCHANGE.lock().await;
+    let sim = Arc::new(Mutex::new(Sim {
+        price: 10.0,
+        ..Sim::default()
+    }));
+    let mut cfg = model::Config {
+        pairs: vec!["BTC/USDT".into()],
+        ..model::Config::default()
+    };
+    cfg.ai.schedule_mode = "ai".into();
+    let (app, dir, server) = sim_app(&sim, cfg).await;
+    // The simulator's candles all close at 10.
+    let at = chrono::Utc::now().timestamp();
+    let set_at = at.div_euclid(900) * 900 - 900 - 1;
+    let watch = |kind: &str, price: f64| crate::hooks::Watch {
+        id: kind.into(),
+        kind: kind.into(),
+        pair: "BTC/USDT".into(),
+        price,
+        interval: Some("15m".into()),
+        note: String::new(),
+        set_at,
+        expires_at: at + 3600,
+        checked_close: 0,
+    };
+    app.set_watches(&crate::hooks::WatchList {
+        watches: vec![watch("close_below", 10.01), watch("close_above", 10.5)],
+        rejected: vec![],
+    })
+    .unwrap();
+    app.check_watches(&HashMap::new(), at).await.unwrap();
+    let pending = app.hooks.lock().unwrap().pending.clone();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0]["condition"]["type"], "close_below");
+    assert_eq!(pending[0]["close"], 10.0);
+    // The one that did not fire remembers the candle it compared, and is not read again.
+    let left = app.watch_list().unwrap().watches;
+    assert_eq!(left.len(), 1);
+    assert_eq!(
+        left[0].checked_close,
+        (at.div_euclid(900) * 900 - 900) * 1000
+    );
+    let calls = sim.lock().await.calls.len();
+    app.check_watches(&HashMap::new(), at).await.unwrap();
+    assert_eq!(sim.lock().await.calls.len(), calls);
+    server.abort();
+    std::env::remove_var("BYBIT_BASE_URL");
+    drop(app);
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -3,7 +3,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { useFeedback } from "@/components/Feedback";
 import { api, del, post } from "@/lib/api";
-import { AiData, HOOK_LABEL, Hooks } from "@/lib/ai";
+import { AiData, HOOK_LABEL, Hooks, watchText } from "@/lib/ai";
 import { utc } from "@/lib/fmt";
 import { useOv } from "@/lib/store";
 import { Card, MsgBox, Skeleton, StateLabel, useAction } from "@/lib/ui";
@@ -17,6 +17,9 @@ export default function AiControls() {
   const [delay, setDelay] = useState(180);
   const [shadow, setShadow] = useState(false);
   const [review, setReview] = useState(true);
+  const [mode, setMode] = useState<"fixed" | "ai">("fixed");
+  const [minM, setMinM] = useState(5);
+  const [maxM, setMaxM] = useState(240);
   const [hk, setHk] = useState<Hooks | null>(null);
   const [newToken, setNewToken] = useState("");
 
@@ -28,6 +31,9 @@ export default function AiControls() {
       setDelay(r.config.delay_seconds ?? 180);
       setShadow(!!r.config.shadow);
       setReview(r.config.review !== false);
+      setMode(r.config.schedule_mode === "ai" ? "ai" : "fixed");
+      setMinM(r.config.ai_min_minutes ?? 5);
+      setMaxM(r.config.ai_max_minutes ?? 240);
       setHk(r.config.hooks ?? null);
     } catch { /* The shared overview already reports connection failures. */ }
   }, []);
@@ -42,7 +48,7 @@ export default function AiControls() {
       if (document.visibilityState !== "visible") return;
       try {
         const r = await api<AiData>("/api/ai");
-        setData((previous) => previous ? { ...previous, state: r.state, position_count: r.position_count, max_open: r.max_open } : previous);
+        setData((previous) => previous ? { ...previous, state: r.state, watches: r.watches, position_count: r.position_count, max_open: r.max_open } : previous);
       } catch { /* The shared overview already reports connection failures. */ }
     }, 15000);
     return () => clearInterval(timer);
@@ -57,7 +63,8 @@ export default function AiControls() {
     await run("save", async () => {
       if (!Number.isInteger(freq) || freq < 1 || freq > 1440) throw new Error("分析间隔须为 1 到 1440 分钟");
       if (!Number.isInteger(delay) || delay < 0 || delay >= freq * 60) throw new Error("延迟须为非负整数秒，且小于分析间隔");
-      await post("/api/ai/config", { interval: freq, delay_seconds: delay, shadow, review });
+      if (mode === "ai" && (!Number.isInteger(minM) || !Number.isInteger(maxM) || minM < 1 || maxM < minM || maxM > 1440)) throw new Error("AI 自定时间须满足 1 ≤ 最短 ≤ 最长 ≤ 1440 分钟");
+      await post("/api/ai/config", { interval: freq, delay_seconds: delay, shadow, review, schedule_mode: mode, ai_min_minutes: minM, ai_max_minutes: maxM });
       await load();
       return { kind: "good", text: "已保存。" };
     });
@@ -151,6 +158,7 @@ export default function AiControls() {
             <div>
               <span>下次分析</span>
               <b>{st?.running ? "分析中…" : !on ? "—" : st?.next_run ? utc(st.next_run) : "等待调度"}</b>
+              {on && !st?.running && c?.schedule_mode === "ai" && st?.next_reason ? <span className="muted">{st.next_reason}</span> : null}
             </div>
             <div>
               <span>AI 当前持仓</span>
@@ -165,6 +173,24 @@ export default function AiControls() {
               </b>
             </div>
           </div>
+          {c?.schedule_mode === "ai" ? (
+            <div style={{ marginTop: 8 }}>
+              <span className="f">AI 设置的叫醒条件</span>
+              {data?.watches?.length ? (
+                <ul className="hint" style={{ margin: "4px 0 0", paddingLeft: 18 }}>
+                  {data.watches.map((w, i) => (
+                    <li key={i}>
+                      <b>{watchText(w)}</b>
+                      {w.note ? `：${w.note}` : ""}
+                      {w.expires_utc ? <span className="muted">（{utc(w.expires_utc)} 前有效）</span> : null}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="hint">暂无。由 AI 每轮自己设置和取消。</p>
+              )}
+            </div>
+          ) : null}
           <p className="hint">同时最多持有 {d.max_open_limit ?? 5} 笔是系统上限，不要求开满，平仓后释放名额。</p>
           <div className="row">
             {!on ? (
@@ -197,10 +223,38 @@ export default function AiControls() {
             <Skeleton lines={4} />
           ) : (
             <>
+              <label className="f">调度方式</label>
+              <div className="row" style={{ marginTop: 4 }}>
+                <label className="toggle">
+                  <input type="radio" name="aiMode" checked={mode === "fixed"} onChange={() => setMode("fixed")} />
+                  <span>固定间隔</span>
+                </label>
+                <label className="toggle">
+                  <input type="radio" name="aiMode" checked={mode === "ai"} onChange={() => setMode("ai")} />
+                  <span>由 AI 决定</span>
+                </label>
+              </div>
+              {mode === "ai" ? (
+                <>
+                  <p className="hint">
+                    每轮分析后，AI 自己定下次什么时候再看（在下面的范围内），还可以设价格或 K 线收盘条件，满足时提前叫醒它。条件只负责叫醒，不能直接下单，叫醒受下方事件触发的间隔和每小时次数限制。分析失败时按下面的「兜底间隔」再试。
+                  </p>
+                  <div className="ai-fields">
+                    <div>
+                      <label className="f" htmlFor="aiMin">最短间隔（分钟）</label>
+                      <input id="aiMin" type="number" min={1} max={1440} step={1} value={minM} onChange={(e) => setMinM(+e.target.value)} />
+                    </div>
+                    <div>
+                      <label className="f" htmlFor="aiMax">最长间隔（分钟）</label>
+                      <input id="aiMax" type="number" min={1} max={1440} step={1} value={maxM} onChange={(e) => setMaxM(+e.target.value)} />
+                    </div>
+                  </div>
+                </>
+              ) : null}
               <div className="ai-fields">
                 <div>
                   <label className="f" htmlFor="aiInterval">
-                    分析间隔（分钟）
+                    {mode === "ai" ? "兜底间隔（分钟）" : "分析间隔（分钟）"}
                   </label>
                   <input id="aiInterval" type="number" min={1} max={1440} step={1} value={freq} onChange={(e) => setFreq(+e.target.value)} list="aiIntervalPresets" />
                   <datalist id="aiIntervalPresets">{[1,5,15,30,60,120,240,1440].map((minutes) => <option key={minutes} value={minutes} />)}</datalist>

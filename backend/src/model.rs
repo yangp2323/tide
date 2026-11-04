@@ -74,6 +74,12 @@ pub struct AiConfig {
     pub enabled: bool,
     pub interval: u32,
     pub delay_seconds: u32,
+    /// "fixed" runs every `interval` minutes; "ai" lets the model choose its next run time
+    /// within the bounds below and set its own price conditions, with `interval` as the
+    /// fallback when a run fails.
+    pub schedule_mode: String,
+    pub ai_min_minutes: u32,
+    pub ai_max_minutes: u32,
     pub min_confidence: f64,
     /// Profit goal for each UTC day, as a percent of that day's starting equity; 0 disables it.
     pub daily_profit_target_pct: f64,
@@ -195,6 +201,10 @@ impl AiConfig {
         a.base_url = ch.base_url.clone();
         a
     }
+    /// Whether the model picks its own next run time and wake-up conditions.
+    pub fn ai_schedule(&self) -> bool {
+        self.schedule_mode == "ai"
+    }
     pub fn active(&self) -> Option<&Channel> {
         self.channels.iter().find(|c| c.id == self.active_channel)
     }
@@ -229,6 +239,9 @@ impl Default for AiConfig {
             enabled: false,
             interval: 240,
             delay_seconds: 180,
+            schedule_mode: "fixed".into(),
+            ai_min_minutes: 5,
+            ai_max_minutes: 240,
             min_confidence: 0.6,
             daily_profit_target_pct: 0.0,
             max_daily_loss_pct: 5.0,
