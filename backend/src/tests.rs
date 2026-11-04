@@ -468,6 +468,19 @@ async fn execution_is_durable_and_closing_releases_position_slots() {
         assert_eq!(h.pending[0]["type"], "webhook");
         assert_eq!(h.pending[0]["message"], "BTC 跌破 76000，看看要不要处理");
     }
+    // Alerts that are JSON without a message field, or a bare number, still reach the model.
+    for body in [r#"{"ticker":"BTCUSDT","action":"buy"}"#, "123"] {
+        assert_eq!(hook(&token, body).await.unwrap().status(), 200);
+    }
+    {
+        let mut h = app.hooks.lock().unwrap();
+        assert!(h.pending[1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("BTCUSDT"));
+        assert_eq!(h.pending[2]["message"], "123");
+        h.pending.truncate(1);
+    }
     // The secret is masked when the settings are read, and saving settings keeps it.
     let r = http
         .get(format!("{}/ai", url))

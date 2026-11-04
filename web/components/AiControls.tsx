@@ -248,7 +248,7 @@ export default function AiControls() {
             </label>
             <label className="toggle" style={{ marginTop: 12 }}>
               <input type="checkbox" checked={hk.adverse_move} disabled={!hk.enabled} onChange={(e) => setHk({ ...hk, adverse_move: e.target.checked })} />
-              <span>持仓浮亏走到止损距离的 60%</span>
+              <span>持仓浮亏走到当前止损距离的 60%</span>
             </label>
             <label className="toggle" style={{ marginTop: 12 }}>
               <input type="checkbox" checked={hk.profit_milestone} disabled={!hk.enabled} onChange={(e) => setHk({ ...hk, profit_milestone: e.target.checked })} />

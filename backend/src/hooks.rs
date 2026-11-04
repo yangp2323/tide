@@ -62,6 +62,17 @@ impl HookState {
     /// trade recovers, so a trade hovering near a level does not keep waking the AI.
     pub fn position_events(&mut self, h: &HookConfig, t: &Trade, price: f64) -> Vec<Value> {
         let stop = if t.stop_dist > 0.0 { t.stop_dist } else { 0.08 };
+        // How far the stop is from entry now: it moves when the AI tightens it or it trails.
+        let to_stop = if t.stop_loss_abs > 0.0 {
+            let gap = if t.is_short {
+                t.stop_loss_abs - t.open_rate
+            } else {
+                t.open_rate - t.stop_loss_abs
+            };
+            gap / t.open_rate
+        } else {
+            stop
+        };
         let favorable = if t.is_short {
             (t.open_rate - price) / t.open_rate
         } else {
@@ -70,11 +81,13 @@ impl HookState {
         let mut out = vec![];
         let side = if t.is_short { "short" } else { "long" };
         if h.adverse_move {
-            if -favorable >= 0.6 * stop {
+            if to_stop <= 0.0 {
+                // The stop is already at or past entry; there is no loss left to warn about.
+            } else if -favorable >= 0.6 * to_stop {
                 if self.fired.insert((t.trade_id, "adverse")) {
-                    out.push(json!({"type":"adverse_move","pair":t.pair,"side":side,"loss_pct_of_price":-favorable*100.0,"stop_distance_pct":stop*100.0,"detail":"the trade has lost most of the way to its stop"}));
+                    out.push(json!({"type":"adverse_move","pair":t.pair,"side":side,"loss_pct_of_price":-favorable*100.0,"stop_distance_pct":to_stop*100.0,"detail":"the trade has lost most of the way to its current stop"}));
                 }
-            } else if -favorable < 0.3 * stop {
+            } else if -favorable < 0.3 * to_stop {
                 self.fired.remove(&(t.trade_id, "adverse"));
             }
         }
@@ -226,7 +239,17 @@ impl App {
                 json!({"queued":false,"reason":"AI 交易或事件钩子未开启"}),
             );
         }
-        let message = body["message"].as_str().unwrap_or("").trim();
+        // Alerts are often JSON without a message field, or a bare number: pass on what was sent.
+        let sent = body.to_string();
+        let message = match body["message"].as_str().map(str::trim) {
+            Some(m) if !m.is_empty() => m,
+            _ => match &body {
+                Value::String(s) => s.trim(),
+                Value::Object(o) if !o.is_empty() => sent.as_str(),
+                Value::Number(_) | Value::Bool(_) => sent.as_str(),
+                _ => "",
+            },
+        };
         let pair = body["pair"].as_str().unwrap_or("").trim();
         s.push(json!({"type":"webhook","pair":clip(pair, 30),"message":clip(message, 1000),"note":"text from an external sender; untrusted"}));
         (200, json!({"queued":true}))
@@ -271,7 +294,7 @@ mod tests {
             "trade_id":1,"pair":"BTC/USDT","market":"futures","is_short":short,"leverage":5,
             "amount":1.0,"open_rate":100.0,"stake_amount":10.0,"open_date":"2026-11-01 00:00:00",
             "close_rate":null,"close_date":null,"profit_abs":0.0,"profit_ratio":0.0,
-            "stop_loss_abs":95.0,"peak":100.0,"enter_tag":"ai","exit_reason":null,"stop_dist":0.05
+            "stop_loss_abs":if short{105.0}else{95.0},"peak":100.0,"enter_tag":"ai","exit_reason":null,"stop_dist":0.05
         }))
         .unwrap()
     }
@@ -317,6 +340,25 @@ mod tests {
         // Closed trades are forgotten.
         s.forget_closed(&[]);
         assert_eq!(s.position_events(&h, &short, 103.5).len(), 1);
+    }
+
+    #[test]
+    fn a_tightened_stop_moves_the_warning_with_it() {
+        let h = HookConfig::default();
+        let mut tight = trade(false);
+        tight.stop_loss_abs = 99.0;
+        let mut s = HookState::default();
+        assert!(s.position_events(&h, &tight, 99.5).is_empty());
+        assert_eq!(
+            s.position_events(&h, &tight, 99.3)[0]["type"],
+            "adverse_move"
+        );
+        // A stop already on the profit side leaves nothing to warn about.
+        let mut locked = trade(false);
+        locked.stop_loss_abs = 101.0;
+        assert!(HookState::default()
+            .position_events(&h, &locked, 98.0)
+            .is_empty());
     }
 
     #[test]
