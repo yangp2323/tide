@@ -154,6 +154,7 @@ async fn execution_is_durable_and_closing_releases_position_slots() {
         ai_gate: Mutex::new(()),
         ai_state: Mutex::new(json!({})),
         login_attempts: Mutex::new(vec![]),
+        hooks: Default::default(),
     });
     let actions = json!([{"action":"open_long","pair":"BTC/USDT","confidence":0.9},{"action":"open_long","pair":"ETH/USDT","confidence":0.9}]);
     let result = app
@@ -435,6 +436,91 @@ async fn execution_is_durable_and_closing_releases_position_slots() {
             .status(),
         400
     );
+    // The webhook is reached with no login, only its secret; nothing works until one exists.
+    let hook = |token: &str, body: &'static str| {
+        http.post(format!("{}/hook/{}", url, token))
+            .body(body)
+            .send()
+    };
+    // An earlier step paused the bot; the webhook only queues while trading is on.
+    let mut running = app.store.config().unwrap();
+    running.running = true;
+    running.ai.enabled = true;
+    app.store.save_config(&running).unwrap();
+    app.hooks.lock().unwrap().pending.clear();
+    assert_eq!(hook("anything", "x").await.unwrap().status(), 404);
+    let r = send("/ai/hooks/token", "POST", json!({})).await.unwrap();
+    assert_eq!(r.status(), 200);
+    let token = r.json::<Value>().await.unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(token.len(), 48);
+    assert_eq!(hook("wrong", "x").await.unwrap().status(), 404);
+    let r = hook(&token, "BTC 跌破 76000，看看要不要处理")
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.json::<Value>().await.unwrap()["queued"], true);
+    {
+        let h = app.hooks.lock().unwrap();
+        assert_eq!(h.pending.len(), 1);
+        assert_eq!(h.pending[0]["type"], "webhook");
+        assert_eq!(h.pending[0]["message"], "BTC 跌破 76000，看看要不要处理");
+    }
+    // The secret is masked when the settings are read, and saving settings keeps it.
+    let r = http
+        .get(format!("{}/ai", url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let ai: Value = r.json().await.unwrap();
+    assert_eq!(ai["config"]["hooks"]["webhook_set"], true);
+    assert_ne!(ai["config"]["hooks"]["webhook_token"], token);
+    let r = send(
+        "/ai/config",
+        "POST",
+        json!({"hooks":{"big_move_pct":5.0,"webhook_token":"stolen"}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.status(), 200);
+    let saved = app.store.config().unwrap().ai.hooks;
+    assert_eq!(saved.big_move_pct, 5.0);
+    assert_eq!(saved.webhook_token, token);
+    for bad in [
+        json!({"min_gap_minutes":0}),
+        json!({"max_per_hour":0}),
+        json!({"big_move_pct":0.1}),
+    ] {
+        let r = send("/ai/config", "POST", json!({"hooks":bad}))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400);
+    }
+    // Guessing is throttled.
+    let mut last = 0;
+    for _ in 0..12 {
+        last = hook("guess", "x").await.unwrap().status().as_u16();
+    }
+    assert_eq!(last, 429);
+    let r = http
+        .delete(format!("{}/ai/hooks/token", url))
+        .header("cookie", &cookie)
+        .header("origin", &app.origin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(app
+        .store
+        .config()
+        .unwrap()
+        .ai
+        .hooks
+        .webhook_token
+        .is_empty());
     let r = send(
         "/ai/channels",
         "POST",
@@ -669,6 +755,7 @@ async fn sim_app(
         ai_gate: Mutex::new(()),
         ai_state: Mutex::new(json!({})),
         login_attempts: Mutex::new(vec![]),
+        hooks: Default::default(),
     });
     (app, dir, server)
 }
@@ -1034,6 +1121,7 @@ async fn the_reviewer_can_only_change_its_own_notes() {
         ai_gate: Mutex::new(()),
         ai_state: Mutex::new(json!({})),
         login_attempts: Mutex::new(vec![]),
+        hooks: Default::default(),
     };
     let seeded = app.store.knowledge().unwrap();
     let seed_id = seeded[0]["id"].as_i64().unwrap();
@@ -1179,6 +1267,7 @@ async fn a_review_reads_closed_trades_and_writes_notes() {
         ai_gate: Mutex::new(()),
         ai_state: Mutex::new(json!({})),
         login_attempts: Mutex::new(vec![]),
+        hooks: Default::default(),
     };
     let rec = app.review("manual").await.unwrap();
     assert!(rec["error"].is_null(), "{}", rec);
@@ -1203,6 +1292,156 @@ async fn a_review_reads_closed_trades_and_writes_notes() {
     assert_eq!(log[0]["source"], "review");
     assert_eq!(log[0]["analysis"], "3 笔样本，主动平仓亏损");
     server.abort();
+    drop(app);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn open_trades_raise_hook_events_as_they_move() {
+    let _env = EXCHANGE.lock().await;
+    let sim = Arc::new(Mutex::new(Sim {
+        futures: true,
+        price: 10.0,
+        ..Sim::default()
+    }));
+    let mut cfg = model::Config {
+        market: "futures".into(),
+        pairs: vec!["BTC/USDT:USDT".into()],
+        leverage: 5,
+        short: true,
+        risk_per_trade_pct: 1.0,
+        ..model::Config::default()
+    };
+    cfg.ai.hooks.big_move_pct = 0.0;
+    let (app, dir, server) = sim_app(&sim, cfg).await;
+    let result = app
+        .execute_actions(&[open_long("BTC/USDT:USDT")], false)
+        .await
+        .unwrap();
+    assert_eq!(result[0]["status"], "executed", "{}", result[0]);
+    let tick = || async {
+        let _lock = app.gate.lock().await;
+        app.tick().await.unwrap();
+    };
+    let types = || -> Vec<String> {
+        app.hooks
+            .lock()
+            .unwrap()
+            .pending
+            .iter()
+            .map(|e| e["type"].as_str().unwrap().to_string())
+            .collect()
+    };
+    tick().await;
+    assert!(types().is_empty());
+    // A 4% stop: a 3% loss is past 60% of the way, and it is reported once.
+    sim.lock().await.price = 9.7;
+    tick().await;
+    tick().await;
+    assert_eq!(types(), ["adverse_move"]);
+    // Up one stop distance: the trailing level.
+    sim.lock().await.price = 10.5;
+    tick().await;
+    assert_eq!(types(), ["adverse_move", "profit_milestone"]);
+    // The exchange fills the take profit: that wakes the AI too.
+    {
+        let mut s = sim.lock().await;
+        s.price = 10.8;
+        s.positions.clear();
+        s.external = vec![
+            json!({"side":"Sell","closedSize":"25.0","execType":"Trade","execPrice":"10.8","execFee":"0.1","orderLinkId":""}),
+        ];
+    }
+    tick().await;
+    assert_eq!(
+        types(),
+        ["adverse_move", "profit_milestone", "position_closed"]
+    );
+    let closed = app.hooks.lock().unwrap().pending[2].clone();
+    assert_eq!(closed["reason"], "take_profit_on_exchange");
+    // Hooks switched off queue nothing.
+    let mut c = app.store.config().unwrap();
+    c.ai.hooks.enabled = false;
+    app.store.save_config(&c).unwrap();
+    app.hooks.lock().unwrap().pending.clear();
+    app.push_hook(json!({"type":"big_move","pair":"BTC/USDT"}));
+    assert!(types().is_empty());
+    server.abort();
+    std::env::remove_var("BYBIT_BASE_URL");
+    drop(app);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn queued_events_start_one_run_within_the_limits() {
+    let _env = EXCHANGE.lock().await;
+    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+    async fn model(
+        State(seen): State<Arc<Mutex<Vec<Value>>>>,
+        body: axum::Json<Value>,
+    ) -> axum::Json<Value> {
+        seen.lock().await.push(body.0);
+        let reply = json!({"analysis":"事件已处理，观望","memory":"","actions":[]});
+        axum::Json(
+            json!({"choices":[{"finish_reason":"stop","message":{"content":reply.to_string()}}],"usage":{"completion_tokens":9}}),
+        )
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let model_server = tokio::spawn(
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/v1/chat/completions", axum::routing::post(model))
+                .with_state(seen.clone()),
+        )
+        .into_future(),
+    );
+    let sim = Arc::new(Mutex::new(Sim {
+        price: 10.0,
+        ..Sim::default()
+    }));
+    let mut cfg = model::Config {
+        pairs: vec!["BTC/USDT".into()],
+        ..model::Config::default()
+    };
+    cfg.ai.provider = "openai".into();
+    cfg.ai.model = "m".into();
+    cfg.ai.api_key = "k".into();
+    cfg.ai.base_url = format!("http://{}/v1", addr);
+    let (app, dir, server) = sim_app(&sim, cfg).await;
+    // Nothing queued: nothing runs.
+    assert!(app.dispatch_hooks().await.unwrap().is_none());
+    app.push_hook(json!({"type":"big_move","pair":"BTC/USDT","move_pct":-3.4,"over_minutes":55}));
+    let rec = app.dispatch_hooks().await.unwrap().unwrap();
+    assert!(rec["error"].is_null(), "{}", rec);
+    assert_eq!(rec["source"], "hook");
+    assert_eq!(rec["trigger"]["events"][0]["type"], "big_move");
+    assert!(app.hooks.lock().unwrap().pending.is_empty());
+    // The model is told why it was started.
+    let request = seen.lock().await[0].clone();
+    let user = request["messages"][1]["content"].as_str().unwrap();
+    assert!(
+        user.contains("\"trigger\":{") && user.contains("big_move"),
+        "{}",
+        user
+    );
+    // Too soon after the last run: the event waits instead of starting another run.
+    app.push_hook(json!({"type":"profit_milestone","pair":"BTC/USDT"}));
+    assert!(app.dispatch_hooks().await.unwrap().is_none());
+    assert_eq!(app.hooks.lock().unwrap().pending.len(), 1);
+    // A scheduled run covers whatever was queued, because its snapshot is fresh.
+    let rec = app.run_ai(true, "auto").await.unwrap();
+    assert_eq!(rec["source"], "auto");
+    assert!(app.hooks.lock().unwrap().pending.is_empty());
+    let last = seen.lock().await.last().unwrap().clone();
+    assert!(last["messages"][1]["content"]
+        .as_str()
+        .unwrap()
+        .contains("\"trigger\":{\"type\":\"scheduled\"}"));
+    model_server.abort();
+    server.abort();
+    std::env::remove_var("BYBIT_BASE_URL");
     drop(app);
     std::fs::remove_dir_all(dir).unwrap();
 }

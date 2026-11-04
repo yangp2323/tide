@@ -34,7 +34,28 @@ export type Cfg = {
   max_consecutive_losses: number;
   shadow: boolean;
   review: boolean;
+  hooks: Hooks;
   enabled: boolean;
+};
+
+export type Hooks = {
+  enabled: boolean;
+  adverse_move: boolean;
+  profit_milestone: boolean;
+  position_closed: boolean;
+  big_move_pct: number;
+  min_gap_minutes: number;
+  max_per_hour: number;
+  webhook_token: string | null;
+  webhook_set: boolean;
+};
+
+export const HOOK_LABEL: Record<string, string> = {
+  adverse_move: "浮亏逼近止损",
+  profit_milestone: "浮盈走出一个止损距离",
+  position_closed: "仓位被止损/止盈平掉",
+  big_move: "价格大幅波动",
+  webhook: "外部 Webhook",
 };
 
 export type AiData = {

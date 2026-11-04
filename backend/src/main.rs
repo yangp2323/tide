@@ -3,6 +3,7 @@ mod api;
 mod auth;
 mod engine;
 mod exchange;
+mod hooks;
 mod indicators;
 mod knowledge_seed;
 mod mcp;
@@ -34,6 +35,7 @@ pub struct App {
     pub ai_gate: Mutex<()>,
     pub ai_state: Mutex<Value>,
     pub login_attempts: Mutex<Vec<i64>>,
+    pub hooks: std::sync::Mutex<hooks::HookState>,
 }
 impl App {
     pub fn exchange(&self, c: &model::Config) -> exchange::Bybit {
@@ -122,6 +124,7 @@ async fn main() -> Result<()> {
             json!({"running":false,"last_run":null,"next_run":null,"last_error":null}),
         ),
         login_attempts: Mutex::new(vec![]),
+        hooks: Default::default(),
     });
     let web = std::env::var("TIDE_WEB_DIR").unwrap_or_else(|_| "web/out".into());
     ensure!(
@@ -146,6 +149,7 @@ async fn main() -> Result<()> {
     app.store.log("INFO", "Tide Rust 交易服务启动");
     tokio::spawn(engine::scheduler(app.clone()));
     tokio::spawn(ai::scheduler(app.clone()));
+    tokio::spawn(hooks::scheduler(app.clone()));
     let address = std::env::var("TIDE_LISTEN").unwrap_or_else(|_| "127.0.0.1:8000".into());
     let listener = tokio::net::TcpListener::bind(&address).await?;
     tracing::info!(%address,"listening");

@@ -33,6 +33,10 @@ pub async fn dispatch(State(app): State<Arc<App>>, req: Request) -> Response {
     } else {
         match serde_json::from_slice(&bytes) {
             Ok(v) => v,
+            // Alerts from other systems are often plain text; that text is the message.
+            Err(_) if path.starts_with("/api/hook/") => {
+                json!({"message":String::from_utf8_lossy(&bytes).to_string()})
+            }
             Err(_) => return error(StatusCode::BAD_REQUEST, "JSON 格式无效"),
         }
     };
@@ -67,6 +71,14 @@ pub async fn dispatch(State(app): State<Arc<App>>, req: Request) -> Response {
             }
             _ => return error(StatusCode::UNAUTHORIZED, "账号或密码错误"),
         }
+    }
+    if let Some(token) = path.strip_prefix("/api/hook/").filter(|_| method == "POST") {
+        let (status, body) = app.receive_webhook(token, &body);
+        return (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            Json(body),
+        )
+            .into_response();
     }
     if path == "/api/auth/logout" && method == "POST" {
         return (
@@ -157,6 +169,8 @@ fn ai_public(c: &AiConfig) -> Value {
     for (i, ch) in c.channels.iter().enumerate() {
         v["channels"][i]["api_key"] = json!(mask(&ch.api_key));
     }
+    v["hooks"]["webhook_token"] = json!(mask(&c.hooks.webhook_token));
+    v["hooks"]["webhook_set"] = json!(!c.hooks.webhook_token.is_empty());
     v
 }
 /// Checks that apply to one channel together with the shared AI settings.
@@ -412,6 +426,15 @@ async fn handle(
                 ) {
                     continue;
                 }
+                if k == "hooks" {
+                    // Settings merge in; the webhook secret only changes through its own call.
+                    for (hk, hv) in v.as_object().context("钩子配置无效")? {
+                        if hk != "webhook_token" && hk != "webhook_set" {
+                            value["hooks"][hk] = hv.clone();
+                        }
+                    }
+                    continue;
+                }
                 if k == "api_key" && (v.is_null() || v == "") {
                     continue;
                 }
@@ -425,6 +448,13 @@ async fn handle(
             validate_channel(&a, &a.channels[idx])?;
             a.normalize();
             crate::ai::validate_schedule(a.interval, a.delay_seconds)?;
+            let h = &a.hooks;
+            ensure!(
+                (h.big_move_pct == 0.0 || (0.5..=20.0).contains(&h.big_move_pct))
+                    && (1..=120).contains(&h.min_gap_minutes)
+                    && (1..=60).contains(&h.max_per_hour),
+                "钩子参数超出范围"
+            );
             ensure!(
                 (0.0..=1.0).contains(&a.min_confidence)
                     && (0.5..=50.0).contains(&a.max_daily_loss_pct)
@@ -461,6 +491,19 @@ async fn handle(
             let id: i64 = path.trim_start_matches("/api/knowledge/").parse()?;
             ensure!(app.store.knowledge_delete(id)?, "笔记不存在");
             return Ok(json!({}));
+        }
+        ("POST", "/api/ai/hooks/token") => {
+            let bytes: [u8; 24] = rand::random();
+            c.ai.hooks.webhook_token = hex::encode(bytes);
+            let token = c.ai.hooks.webhook_token.clone();
+            app.store.save_config(&c)?;
+            // The only time the full secret is shown.
+            return Ok(json!({"token":token}));
+        }
+        ("DELETE", "/api/ai/hooks/token") => {
+            c.ai.hooks.webhook_token.clear();
+            app.store.save_config(&c)?;
+            return Ok(ai_public(&c.ai));
         }
         ("POST", "/api/ai/channels") => {
             ensure!(c.ai.channels.len() < 8, "最多保存 8 个渠道");

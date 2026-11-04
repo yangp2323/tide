@@ -368,6 +368,10 @@ impl App {
                     t.pair, t.amount, t.profit_abs
                 ),
             );
+            // Closes the AI or the user asked for are already known; the rest wake the AI.
+            if t.exit_reason.as_deref() != Some("force_exit") {
+                self.push_hook(json!({"type":"position_closed","pair":t.pair,"side":if t.is_short{"short"}else{"long"},"reason":t.exit_reason,"profit_usdt":t.profit_abs}));
+            }
         }
         Ok(())
     }
@@ -1086,7 +1090,9 @@ impl App {
         let ex = self.exchange(&c);
         // Risk exits continue while new entries are paused.
         let mut risk_errors = Vec::new();
-        for mut t in self.store.open_trades()? {
+        let open = self.store.open_trades()?;
+        let open_ids: Vec<i64> = open.iter().map(|t| t.trade_id).collect();
+        for mut t in open {
             let result: Result<()> = async {
                 if self.store.unresolved()?.iter().any(|o| o["pair"] == t.pair) {
                     return Ok(());
@@ -1103,6 +1109,14 @@ impl App {
                     None
                 };
                 let price = ex.price(&t.market, &t.pair).await?;
+                let events = self
+                    .hooks
+                    .lock()
+                    .unwrap()
+                    .position_events(&c.ai.hooks, &t, price);
+                for e in events {
+                    self.push_hook(e);
+                }
                 let (peak, stop) = stop_price(&t, price);
                 let previous = t.stop_loss_abs;
                 // Persist first: if the exchange update fails, the next sync_external_exit
@@ -1147,6 +1161,7 @@ impl App {
                 risk_errors.push(e.to_string());
             }
         }
+        self.hooks.lock().unwrap().forget_closed(&open_ids);
         if let Err(e) = self.watchdog(&c, &ex).await {
             self.store.log("WARNING", &format!("回撤检查失败：{}", e));
         }

@@ -2,8 +2,8 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { useFeedback } from "@/components/Feedback";
-import { api, post } from "@/lib/api";
-import { AiData } from "@/lib/ai";
+import { api, del, post } from "@/lib/api";
+import { AiData, HOOK_LABEL, Hooks } from "@/lib/ai";
 import { AI_ACT, AI_SOURCE, AI_STATUS, base, utc } from "@/lib/fmt";
 import { useOv } from "@/lib/store";
 import { Card, Empty, MsgBox, Skeleton, StateLabel, useAction } from "@/lib/ui";
@@ -22,6 +22,14 @@ function DecisionRow({ r }: { r: any }) {
         {r.seconds ? <span>{r.seconds}s</span> : null}
       </div>
       {r.error ? <div className="msg err">{r.error}</div> : null}
+      {r.trigger?.events?.length ? (
+        <p className="muted">
+          触发：
+          {r.trigger.events
+            .map((e: any) => `${HOOK_LABEL[e.type] || e.type}${e.pair ? " " + base(e.pair) : ""}${e.message ? "：" + String(e.message).slice(0, 60) : ""}`)
+            .join("；")}
+        </p>
+      ) : null}
       {r.analysis ? <p>{r.analysis}</p> : null}
       {(r.changes || []).map((c: any, i: number) => (
         <div className="ai-act" key={`c${i}`}>
@@ -62,6 +70,8 @@ export default function AiPage() {
   const [delay, setDelay] = useState(180);
   const [shadow, setShadow] = useState(false);
   const [review, setReview] = useState(true);
+  const [hk, setHk] = useState<Hooks | null>(null);
+  const [newToken, setNewToken] = useState("");
 
   const load = useCallback(async () => {
     try {
@@ -71,6 +81,7 @@ export default function AiPage() {
       setDelay(r.config.delay_seconds ?? 180);
       setShadow(!!r.config.shadow);
       setReview(r.config.review !== false);
+      setHk(r.config.hooks ?? null);
       setErr("");
     } catch (e: any) {
       setErr(e?.message || "加载失败");
@@ -105,6 +116,40 @@ export default function AiPage() {
       await post("/api/ai/config", { interval: freq, delay_seconds: delay, shadow, review });
       await load();
       return { kind: "good", text: "已保存。" };
+    });
+  }
+
+  async function saveHooks() {
+    if (!hk) return;
+    await run("hooks", async () => {
+      const { webhook_token, webhook_set, ...settings } = hk;
+      await post("/api/ai/config", { hooks: settings });
+      await load();
+      return { kind: "good", text: "已保存。" };
+    });
+  }
+
+  async function makeToken() {
+    if (hk?.webhook_set) {
+      const ok = await confirm({ title: "重新生成 Webhook 地址？", body: "旧地址会立即失效，已经配置了旧地址的外部系统要改成新地址。", ok: "重新生成", danger: true });
+      if (!ok) return;
+    }
+    await run("token", async () => {
+      const r = await post<any>("/api/ai/hooks/token");
+      setNewToken(r.token);
+      await load();
+      return { kind: "good", text: "已生成。完整地址只显示这一次，请现在复制保存。" };
+    });
+  }
+
+  async function dropToken() {
+    const ok = await confirm({ title: "停用 Webhook？", body: "现有地址立即失效。", ok: "停用", danger: true });
+    if (!ok) return;
+    await run("token", async () => {
+      await del("/api/ai/hooks/token");
+      setNewToken("");
+      await load();
+      return { kind: "good", text: "已停用。" };
     });
   }
 
@@ -244,6 +289,85 @@ export default function AiPage() {
           )}
         </Card>
       </div>
+
+      <Card title="事件触发" note="不等定时分析，出事时主动叫醒 AI" className="ai-settings">
+        {!hk ? (
+          <Skeleton lines={4} />
+        ) : (
+          <>
+            <p className="hint">
+              事件触发只是让 AI 提前分析一次，它能做的事和定时分析完全一样，仍受全部风控限制。两次分析之间至少隔一段时间，每小时有次数上限，攒着的事件合并成一次分析；定时分析开始时会一并覆盖已排队的事件。需要 AI 交易开启且机器人在运行。
+            </p>
+            <label className="toggle" style={{ marginTop: 12 }}>
+              <input type="checkbox" checked={hk.enabled} onChange={(e) => setHk({ ...hk, enabled: e.target.checked })} />
+              <span>启用事件触发</span>
+            </label>
+            <label className="toggle" style={{ marginTop: 12 }}>
+              <input type="checkbox" checked={hk.adverse_move} disabled={!hk.enabled} onChange={(e) => setHk({ ...hk, adverse_move: e.target.checked })} />
+              <span>持仓浮亏走到止损距离的 60%</span>
+            </label>
+            <label className="toggle" style={{ marginTop: 12 }}>
+              <input type="checkbox" checked={hk.profit_milestone} disabled={!hk.enabled} onChange={(e) => setHk({ ...hk, profit_milestone: e.target.checked })} />
+              <span>持仓浮盈走出一个止损距离（追踪止损起点）</span>
+            </label>
+            <label className="toggle" style={{ marginTop: 12 }}>
+              <input type="checkbox" checked={hk.position_closed} disabled={!hk.enabled} onChange={(e) => setHk({ ...hk, position_closed: e.target.checked })} />
+              <span>仓位被交易所止损或止盈平掉</span>
+            </label>
+            <div className="ai-fields">
+              <div>
+                <label className="f" htmlFor="hkMove">
+                  币价一小时内波动达到 %（0 = 不启用）
+                </label>
+                <input id="hkMove" type="number" step={0.5} min={0} max={20} value={hk.big_move_pct} disabled={!hk.enabled} onChange={(e) => setHk({ ...hk, big_move_pct: +e.target.value })} />
+                <p className="hint">只看交易策略页里选的币，同一个币两小时内最多触发一次。</p>
+              </div>
+              <div>
+                <label className="f" htmlFor="hkGap">
+                  两次分析至少间隔（分钟）
+                </label>
+                <input id="hkGap" type="number" step={1} min={1} max={120} value={hk.min_gap_minutes} disabled={!hk.enabled} onChange={(e) => setHk({ ...hk, min_gap_minutes: +e.target.value })} />
+              </div>
+              <div>
+                <label className="f" htmlFor="hkMax">
+                  事件触发的分析每小时最多（次）
+                </label>
+                <input id="hkMax" type="number" step={1} min={1} max={60} value={hk.max_per_hour} disabled={!hk.enabled} onChange={(e) => setHk({ ...hk, max_per_hour: +e.target.value })} />
+              </div>
+            </div>
+            <div className="row">
+              <button onClick={saveHooks} disabled={busy === "hooks"}>
+                {busy === "hooks" ? "保存中…" : "保存"}
+              </button>
+            </div>
+
+            <label className="f" style={{ marginTop: 20 }}>外部 Webhook</label>
+            <p className="hint">
+              让 TradingView 等外部系统在需要时叫醒 AI。生成后得到一个带密钥的地址，对它发 POST 请求即可，内容是纯文本或 JSON 的 message 字段。这条消息只会作为不可信的线索交给 AI，不能下单，也不能改任何限制；每小时最多 30 次，猜错密钥会被限速。
+            </p>
+            {newToken ? (
+              <div className="msg warn" style={{ wordBreak: "break-all" }}>
+                {`${typeof location !== "undefined" ? location.origin : ""}/api/hook/${newToken}`}
+                <div className="muted">只显示这一次。示例：curl -X POST -d "BTC 突破前高" 上面的地址</div>
+              </div>
+            ) : hk.webhook_set ? (
+              <p className="hint">已启用，密钥 {hk.webhook_token}（完整地址不再显示，忘了可以重新生成）。</p>
+            ) : (
+              <p className="hint">未启用。</p>
+            )}
+            <div className="row">
+              <button className="ghost" onClick={makeToken} disabled={busy === "token"}>
+                {hk.webhook_set ? "重新生成地址" : "生成 Webhook 地址"}
+              </button>
+              {hk.webhook_set && (
+                <button className="ghost" onClick={dropToken} disabled={busy === "token"}>
+                  停用
+                </button>
+              )}
+            </div>
+          </>
+        )}
+      </Card>
 
       <Card
         title="决策记录"

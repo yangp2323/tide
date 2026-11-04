@@ -85,6 +85,11 @@ pub async fn protect(State(app): State<Arc<App>>, req: Request, next: Next) -> R
     let api = path.starts_with("/api/");
     let is_login = path == "/api/auth/login";
     let method = req.method().as_str();
+    // The webhook is called by other systems: it has no cookie or Origin, and its secret in the
+    // URL is the credential instead.
+    if path.starts_with("/api/hook/") && method == "POST" {
+        return next.run(req).await;
+    }
     if !matches!(method, "GET" | "HEAD" | "OPTIONS")
         && req.headers().get("origin").and_then(|h| h.to_str().ok()) != Some(app.origin.as_str())
     {

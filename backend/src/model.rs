@@ -84,10 +84,46 @@ pub struct AiConfig {
     pub shadow: bool,
     /// Let the AI review its closed trades and keep its own observations in the knowledge base.
     pub review: bool,
+    /// Events that start an analysis between scheduled runs.
+    pub hooks: HookConfig,
     /// Saved API channels. The model fields above always mirror the active one, so code that
     /// reads them (and an older build reading the same file) sees the channel in use.
     pub channels: Vec<Channel>,
     pub active_channel: String,
+}
+/// Hooks wake the AI when something happens instead of waiting for the next scheduled run.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HookConfig {
+    pub enabled: bool,
+    /// An open trade has lost most of the way to its stop.
+    pub adverse_move: bool,
+    /// An open trade has gained one stop distance, where trailing starts.
+    pub profit_milestone: bool,
+    /// The exchange stop or take profit closed a trade.
+    pub position_closed: bool,
+    /// A watched pair moved this much within about an hour; 0 turns it off.
+    pub big_move_pct: f64,
+    /// Never start a run sooner than this after the previous one.
+    pub min_gap_minutes: u32,
+    /// Most event-started runs in any hour.
+    pub max_per_hour: u32,
+    /// Secret in the webhook URL; empty means the webhook is off.
+    pub webhook_token: String,
+}
+impl Default for HookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            adverse_move: true,
+            profit_milestone: true,
+            position_closed: true,
+            big_move_pct: 3.0,
+            min_gap_minutes: 5,
+            max_per_hour: 6,
+            webhook_token: String::new(),
+        }
+    }
 }
 /// One way of reaching a model: provider, endpoint, key and model options.
 #[derive(Clone, Serialize, Deserialize)]
@@ -197,6 +233,7 @@ impl Default for AiConfig {
             max_consecutive_losses: 5,
             shadow: false,
             review: true,
+            hooks: HookConfig::default(),
             channels: vec![],
             active_channel: String::new(),
         }
