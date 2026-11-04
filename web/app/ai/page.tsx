@@ -12,6 +12,7 @@ type Cfg = {
   claude_thinking: string;
   claude_effort: string;
   claude_thinking_budget: number;
+  stream: boolean;
   model: string;
   base_url: string;
   api_key: string | null;
@@ -77,6 +78,7 @@ export default function AiPage() {
   const [claudeThinking, setClaudeThinking] = useState("default");
   const [claudeEffort, setClaudeEffort] = useState("default");
   const [claudeBudget, setClaudeBudget] = useState(4096);
+  const [stream, setStream] = useState(false);
   const [model, setModel] = useState(DEFAULT_MODEL.anthropic);
   const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
@@ -92,6 +94,7 @@ export default function AiPage() {
     setClaudeThinking(c.claude_thinking || "default");
     setClaudeEffort(c.claude_effort || "default");
     setClaudeBudget(c.claude_thinking_budget ?? 4096);
+    setStream(!!c.stream);
     setModel(c.model);
     setBaseUrl(c.base_url || "");
     setFreq(c.interval);
@@ -151,6 +154,7 @@ export default function AiPage() {
         claude_thinking: claudeThinking,
         claude_effort: claudeEffort,
         claude_thinking_budget: claudeBudget,
+        stream,
         model,
         base_url: baseUrl,
         api_key: apiKey || null,
@@ -314,11 +318,18 @@ export default function AiPage() {
                     <div className="ai-budget">
                       <label className="f" htmlFor="claudeBudget">手动思考预算（tokens）</label>
                       <input id="claudeBudget" type="number" min={1024} max={15999} step={1} value={claudeBudget} onChange={(e) => setClaudeBudget(+e.target.value)} />
-                      <p className="hint">范围 1024–15999；与最终回答共用 32000 tokens 总输出上限。</p>
+                      <p className="hint">范围 1024–15999；与最终回答共用总输出上限（非流式 32000，流式 64000 tokens）。</p>
                     </div>
                   )}
                 </div>
               )}
+              <label className="toggle" style={{ marginTop: 12 }}>
+                <input type="checkbox" checked={stream} onChange={(e) => setStream(e.target.checked)} />
+                <span>流式输出</span>
+              </label>
+              <p className="hint">
+                模型边生成边传回，长时间思考时连接不会被中转站当作无响应断开，适合高思考等级。{provider === "anthropic" ? "开启后 Claude 输出上限从 32000 提高到 64000 tokens。" : ""}收齐完整结果后才会执行交易；中转站不支持流式时请关闭。
+              </p>
               <label className="f" htmlFor="aiModel">
                 模型
               </label>

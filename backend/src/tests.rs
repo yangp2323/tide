@@ -317,7 +317,7 @@ async fn execution_is_durable_and_closing_releases_position_slots() {
         .post(format!("{}/ai/config", url))
         .header("cookie", &cookie)
         .header("origin", &app.origin)
-        .json(&json!({"interval":7,"delay_seconds":20,"api_protocol":"responses","reasoning_effort":"high","claude_thinking":"adaptive","claude_effort":"high","claude_thinking_budget":4096}))
+        .json(&json!({"interval":7,"delay_seconds":20,"api_protocol":"responses","reasoning_effort":"high","claude_thinking":"adaptive","claude_effort":"high","claude_thinking_budget":4096,"stream":true}))
         .send()
         .await
         .unwrap();
@@ -330,6 +330,7 @@ async fn execution_is_durable_and_closing_releases_position_slots() {
     assert_eq!(config["claude_thinking"], "adaptive");
     assert_eq!(config["claude_effort"], "high");
     assert_eq!(config["claude_thinking_budget"], 4096);
+    assert_eq!(config["stream"], true);
     for invalid in [
         json!({"interval":0}),
         json!({"interval":1441}),

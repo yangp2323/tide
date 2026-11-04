@@ -56,6 +56,9 @@ pub struct AiConfig {
     pub claude_thinking: String,
     pub claude_effort: String,
     pub claude_thinking_budget: u32,
+    /// Request server-sent events instead of one JSON body, so long thinking
+    /// keeps the connection busy and the larger Claude output limit is safe.
+    pub stream: bool,
     pub model: String,
     pub api_key: String,
     pub base_url: String,
@@ -74,6 +77,7 @@ impl Default for AiConfig {
             claude_thinking: "default".into(),
             claude_effort: "default".into(),
             claude_thinking_budget: 4096,
+            stream: false,
             model: "claude-opus-5-5".into(),
             api_key: String::new(),
             base_url: String::new(),

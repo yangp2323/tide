@@ -176,15 +176,30 @@ impl App {
     }
 }
 async fn call_model(c: &Config, snap: &Value) -> Result<(String, Value)> {
-    let http = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(20))
-        .timeout(std::time::Duration::from_secs(600))
-        .build()?;
     let ai = &c.ai;
+    // A stream may run longer as a whole; it only fails when the server goes quiet.
+    let http = if ai.stream {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(20))
+            .read_timeout(std::time::Duration::from_secs(300))
+            .timeout(std::time::Duration::from_secs(1800))
+    } else {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(20))
+            .timeout(std::time::Duration::from_secs(600))
+    }
+    .build()?;
     let (url, body) = model_request(ai, snap)?;
     let request = http
         .post(&url)
-        .header("accept", "application/json")
+        .header(
+            "accept",
+            if ai.stream {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+        )
         .json(&body);
     let request = if ai.provider == "anthropic" {
         request
@@ -202,8 +217,123 @@ async fn call_model(c: &Config, snap: &Value) -> Result<(String, Value)> {
         .unwrap_or("unknown")
         .to_string();
     let text = response.text().await?;
-    let v = decode_model_body(status, &content_type, &text, &ai.api_key, &url)?;
+    let is_stream = content_type.contains("text/event-stream")
+        || text.trim_start().starts_with("event:")
+        || text.trim_start().starts_with("data:");
+    let v = if ai.stream && status.is_success() && is_stream {
+        let kind = if ai.provider == "anthropic" {
+            "anthropic"
+        } else {
+            ai.api_protocol.as_str()
+        };
+        let v = assemble_stream(kind, &text)?;
+        api_error(&v, &ai.api_key)?;
+        v
+    } else {
+        // Errors, and gateways that ignore the stream flag, still answer with plain JSON.
+        decode_model_body(status, &content_type, &text, &ai.api_key, &url)?
+    };
     parse_model_response(&v)
+}
+
+/// Rebuild the non-streaming response shape from server-sent events, so the same
+/// completeness, refusal and text checks apply to both modes. Thinking deltas are
+/// dropped; a stream without its final event counts as incomplete.
+fn assemble_stream(kind: &str, text: &str) -> Result<Value> {
+    let events = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data:"))
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && *d != "[DONE]")
+        .map(serde_json::from_str::<Value>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("模型流式数据不是有效 JSON")?;
+    if let Some(e) = events.iter().find(|e| !e["error"].is_null()) {
+        return Ok(json!({"error": e["error"]}));
+    }
+    let incomplete =
+        || json!({"status":"incomplete","incomplete_details":{"reason":"stream_interrupted"}});
+    match kind {
+        "anthropic" => {
+            let mut text = String::new();
+            let mut stop = Value::Null;
+            let mut usage = json!({});
+            for e in &events {
+                match e["type"].as_str() {
+                    Some("message_start") => usage = e["message"]["usage"].clone(),
+                    Some("content_block_delta") if e["delta"]["type"] == "text_delta" => {
+                        text += e["delta"]["text"].as_str().unwrap_or("")
+                    }
+                    Some("message_delta") => {
+                        stop = e["delta"]["stop_reason"].clone();
+                        if let (Some(u), Some(d)) = (usage.as_object_mut(), e["usage"].as_object())
+                        {
+                            u.extend(d.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if stop.is_null() {
+                return Ok(incomplete());
+            }
+            Ok(json!({"content":[{"type":"text","text":text}],"stop_reason":stop,"usage":usage}))
+        }
+        "responses" => Ok(events
+            .iter()
+            .rev()
+            .find(|e| {
+                matches!(
+                    e["type"].as_str(),
+                    Some("response.completed" | "response.incomplete" | "response.failed")
+                )
+            })
+            .map_or_else(incomplete, |e| e["response"].clone())),
+        _ => {
+            let mut text = String::new();
+            let mut refusal = String::new();
+            let mut finish = Value::Null;
+            let mut usage = Value::Null;
+            for e in &events {
+                let choice = &e["choices"][0];
+                text += choice["delta"]["content"].as_str().unwrap_or("");
+                refusal += choice["delta"]["refusal"].as_str().unwrap_or("");
+                if !choice["finish_reason"].is_null() {
+                    finish = choice["finish_reason"].clone();
+                }
+                if !e["usage"].is_null() {
+                    usage = e["usage"].clone();
+                }
+            }
+            if finish.is_null() {
+                return Ok(incomplete());
+            }
+            let mut message = json!({"content":text});
+            if !refusal.is_empty() {
+                message["refusal"] = json!(refusal);
+            }
+            Ok(json!({"choices":[{"finish_reason":finish,"message":message}],"usage":usage}))
+        }
+    }
+}
+
+fn api_error(v: &Value, key: &str) -> Result<()> {
+    if !v["error"].is_null() {
+        let message = v["error"]["message"]
+            .as_str()
+            .or_else(|| v["error"].as_str())
+            .unwrap_or("未知接口错误");
+        let safe = if key.is_empty() {
+            message.into()
+        } else {
+            message.replace(key, "[redacted]")
+        };
+        bail!(
+            "模型接口错误：{}",
+            safe.chars().take(1000).collect::<String>()
+        );
+    }
+    Ok(())
 }
 
 fn decode_model_body(
@@ -237,7 +367,7 @@ fn decode_model_body(
         !content_type.contains("text/event-stream")
             && !text.trim_start().starts_with("event:")
             && !text.trim_start().starts_with("data:"),
-        "模型接口返回了流式数据，但项目请求为非流式；请检查中转服务的强制流式设置（地址 {}）",
+        "模型接口返回了流式数据，但项目请求为非流式；可在 AI 页开启流式输出，或检查中转服务的强制流式设置（地址 {}）",
         endpoint
     );
     let v: Value = serde_json::from_str(text).with_context(|| {
@@ -246,21 +376,7 @@ fn decode_model_body(
             status, content_type, endpoint
         )
     })?;
-    if !v["error"].is_null() {
-        let message = v["error"]["message"]
-            .as_str()
-            .or_else(|| v["error"].as_str())
-            .unwrap_or("未知接口错误");
-        let safe = if key.is_empty() {
-            message.into()
-        } else {
-            message.replace(key, "[redacted]")
-        };
-        bail!(
-            "模型接口错误：{}",
-            safe.chars().take(1000).collect::<String>()
-        );
-    }
+    api_error(&v, key)?;
     Ok(v)
 }
 
@@ -326,7 +442,8 @@ fn model_request(ai: &AiConfig, snap: &Value) -> Result<(String, Value)> {
         } else {
             format!("{}/v1/messages", base)
         };
-        let mut body = json!({"model":ai.model,"stream":false,"max_tokens":32000,"system":SYSTEM,"messages":[{"role":"user","content":user}]});
+        let max_tokens = if ai.stream { 64000 } else { 32000 };
+        let mut body = json!({"model":ai.model,"stream":ai.stream,"max_tokens":max_tokens,"system":SYSTEM,"messages":[{"role":"user","content":user}]});
         match ai.claude_thinking.as_str() {
             "adaptive" => body["thinking"] = json!({"type":"adaptive"}),
             "enabled" => {
@@ -362,14 +479,17 @@ fn model_request(ai: &AiConfig, snap: &Value) -> Result<(String, Value)> {
     let (path, mut body) = if ai.api_protocol == "responses" {
         (
             "responses",
-            json!({"model":ai.model,"stream":false,"store":false,"instructions":SYSTEM,"input":user,"text":{"format":{"type":"json_object"}}}),
+            json!({"model":ai.model,"stream":ai.stream,"store":false,"instructions":SYSTEM,"input":user,"text":{"format":{"type":"json_object"}}}),
         )
     } else {
         (
             "chat/completions",
-            json!({"model":ai.model,"stream":false,"response_format":{"type":"json_object"},"messages":[{"role":"system","content":SYSTEM},{"role":"user","content":user}]}),
+            json!({"model":ai.model,"stream":ai.stream,"response_format":{"type":"json_object"},"messages":[{"role":"system","content":SYSTEM},{"role":"user","content":user}]}),
         )
     };
+    if ai.stream && ai.api_protocol != "responses" {
+        body["stream_options"] = json!({"include_usage":true});
+    }
     if ai.reasoning_effort != "default" {
         if ai.api_protocol == "responses" {
             body["reasoning"] = json!({"effort":ai.reasoning_effort});
@@ -700,8 +820,10 @@ mod model_tests {
         let headers = req.headers().clone();
         let bytes = axum::body::to_bytes(req.into_body(), 65536).await.unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(headers["accept"], "application/json");
-        assert_eq!(body["stream"], false);
+        if body["stream"] == true && body["model"] != "unsupported" {
+            assert_eq!(headers["accept"], "text/event-stream");
+            return mock_stream(&path, &body).into_response();
+        }
         if body["model"] == "unsupported" {
             return (
                 axum::http::StatusCode::BAD_REQUEST,
@@ -711,6 +833,8 @@ mod model_tests {
             )
                 .into_response();
         }
+        assert_eq!(headers["accept"], "application/json");
+        assert_eq!(body["stream"], false);
         let decision = "{\"analysis\":\"test\",\"actions\":[]}";
         let response = match path.as_str() {
             "/v1/responses" => {
@@ -771,6 +895,102 @@ mod model_tests {
         axum::Json(response).into_response()
     }
 
+    fn sse(events: &[Value]) -> String {
+        events
+            .iter()
+            .map(|e| {
+                format!(
+                    "event: {}\ndata: {}\n\n",
+                    e["type"].as_str().unwrap_or("message"),
+                    e
+                )
+            })
+            .collect()
+    }
+
+    fn mock_stream(path: &str, body: &Value) -> ([(&'static str, &'static str); 1], String) {
+        let a = "{\"analysis\":\"te";
+        let b = "st\",\"actions\":[]}";
+        let text = match path {
+            "/v1/messages" => {
+                assert_eq!(body["max_tokens"], 64000);
+                sse(&[
+                    json!({"type":"message_start","message":{"usage":{"input_tokens":5}}}),
+                    json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}),
+                    json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"{}"}}),
+                    json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":a}}),
+                    json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":b}}),
+                    json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":8}}),
+                    json!({"type":"message_stop"}),
+                ])
+            }
+            "/v1/responses" => {
+                assert!(body.get("stream_options").is_none());
+                sse(&[
+                    json!({"type":"response.output_text.delta","delta":a}),
+                    json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":format!("{}{}", a, b)}]}],"usage":{"output_tokens":8}}}),
+                ])
+            }
+            _ => {
+                assert_eq!(body["stream_options"]["include_usage"], true);
+                sse(&[
+                    json!({"choices":[{"delta":{"reasoning_content":"{}"},"finish_reason":null}]}),
+                    json!({"choices":[{"delta":{"content":a},"finish_reason":null}]}),
+                    json!({"choices":[{"delta":{"content":b},"finish_reason":"stop"}]}),
+                    json!({"choices":[],"usage":{"completion_tokens":8}}),
+                ]) + "data: [DONE]\n\n"
+            }
+        };
+        ([("content-type", "text/event-stream")], text)
+    }
+
+    #[test]
+    fn interrupted_or_truncated_streams_are_never_decisions() {
+        let text_delta =
+            json!({"type":"content_block_delta","delta":{"type":"text_delta","text":"{}"}});
+        let cut_off = json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":64000}});
+        let cases = [
+            ("anthropic", sse(std::slice::from_ref(&text_delta))),
+            ("anthropic", sse(&[text_delta.clone(), cut_off.clone()])),
+            (
+                "chat_completions",
+                sse(&[json!({"choices":[{"delta":{"content":"{}"},"finish_reason":null}]})]),
+            ),
+            (
+                "chat_completions",
+                sse(&[json!({"choices":[{"delta":{"content":"{}"},"finish_reason":"length"}]})]),
+            ),
+            (
+                "chat_completions",
+                sse(&[json!({"choices":[{"delta":{"refusal":"no"},"finish_reason":"stop"}]})]),
+            ),
+            (
+                "responses",
+                sse(&[json!({"type":"response.output_text.delta","delta":"{}"})]),
+            ),
+            (
+                "responses",
+                sse(&[
+                    json!({"type":"response.incomplete","response":{"status":"incomplete","output":[]}}),
+                ]),
+            ),
+        ];
+        for (kind, text) in cases {
+            let v = assemble_stream(kind, &text).unwrap();
+            assert!(parse_model_response(&v).is_err(), "{} {}", kind, text);
+        }
+        let v = assemble_stream("anthropic", &sse(&[cut_off])).unwrap();
+        let error = parse_model_response(&v).unwrap_err().to_string();
+        assert!(error.contains("max_tokens") && error.contains("64000"));
+        let v = assemble_stream(
+            "anthropic",
+            &sse(&[json!({"type":"error","error":{"type":"overloaded_error","message":"busy k"}})]),
+        )
+        .unwrap();
+        let error = api_error(&v, "k").unwrap_err().to_string();
+        assert!(error.contains("busy") && !error.contains(" k"));
+    }
+
     #[tokio::test]
     async fn sends_each_protocol_and_parses_only_final_answers() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -816,7 +1036,27 @@ mod model_tests {
                 json!([])
             );
         }
+        c.ai.model = "stream-test".into();
+        c.ai.claude_thinking = "default".into();
+        c.ai.claude_effort = "default".into();
+        c.ai.stream = true;
+        for (provider, protocol) in [
+            ("openai", "chat_completions"),
+            ("openai", "responses"),
+            ("anthropic", "chat_completions"),
+        ] {
+            c.ai.provider = provider.into();
+            c.ai.api_protocol = protocol.into();
+            let (text, usage) = call_model(&c, &json!({})).await.unwrap();
+            let result: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(result["analysis"], "test", "{}", protocol);
+            assert!(usage.is_object(), "{} {}", protocol, usage);
+        }
+        // Errors arrive as plain JSON even when streaming was requested.
         c.ai.model = "unsupported".into();
+        let error = call_model(&c, &json!({})).await.unwrap_err().to_string();
+        assert!(error.contains("400") && error.contains("unsupported reasoning_effort"));
+        c.ai.stream = false;
         let error = call_model(&c, &json!({})).await.unwrap_err().to_string();
         assert!(error.contains("400") && error.contains("unsupported reasoning_effort"));
         assert!(!error.contains("test-model-key"));
