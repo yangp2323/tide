@@ -204,7 +204,14 @@ export default function AiControls() {
                   </label>
                   <input id="aiInterval" type="number" min={1} max={1440} step={1} value={freq} onChange={(e) => setFreq(+e.target.value)} list="aiIntervalPresets" />
                   <datalist id="aiIntervalPresets">{[1,5,15,30,60,120,240,1440].map((minutes) => <option key={minutes} value={minutes} />)}</datalist>
-                  <p className="hint">可自定义 1–1440 分钟，例如每 5、15、30 分钟一次。</p>
+                  <div style={{ marginTop: 8 }}>
+                    <button type="button" className="ghost sm" onClick={() => { setFreq(240); setDelay(180); }}>
+                      对齐 4 小时 K 线（推荐）
+                    </button>
+                  </div>
+                  <p className="hint">
+                    可自定义 1–1440 分钟。行情用 4 小时已收盘 K 线，每 4 小时才变一次；间隔短于 4 小时时，多数轮次看到的已收盘数据和上一轮相同，只有现价和持仓不同。要更及时的反应，请用下方的事件触发。
+                  </p>
                 </div>
                 <div>
                   <label className="f" htmlFor="aiDelay">计划时间后延迟（秒）</label>

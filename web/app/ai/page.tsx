@@ -1,7 +1,7 @@
 "use client";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/api";
-import { AiData, HOOK_LABEL } from "@/lib/ai";
+import { AiData, HOOK_LABEL, UsageDay } from "@/lib/ai";
 import { AI_ACT, AI_SOURCE, AI_STATUS, base, utc } from "@/lib/fmt";
 import { Card, Empty, Skeleton } from "@/lib/ui";
 
@@ -90,6 +90,47 @@ function DecisionRow({ r }: { r: any }) {
   );
 }
 
+const tok = (n: number) => (n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n));
+
+function UsageCard() {
+  const [days, setDays] = useState<UsageDay[] | null>(null);
+  useEffect(() => {
+    api<UsageDay[]>("/api/ai/usage?limit=14").then(setDays).catch(() => setDays([]));
+  }, []);
+  if (!days?.length) return null;
+  return (
+    <Card title="调用与用量" note="最近 14 天，只统计 token，不换算金额（价格取决于你的模型和渠道）">
+      <div style={{ overflowX: "auto" }}>
+        <table className="tbl">
+          <thead>
+            <tr>
+              <th>日期（UTC）</th>
+              <th>调用</th>
+              <th>输入</th>
+              <th>缓存命中</th>
+              <th>输出</th>
+            </tr>
+          </thead>
+          <tbody>
+            {days.map((d) => (
+              <tr key={d.date}>
+                <td className="t">{d.date.slice(5)}</td>
+                <td title={Object.entries(d.by_source).map(([k, v]) => `${AI_SOURCE[k] || k} ${v}`).join("，")}>
+                  {d.calls}
+                  {d.failed ? ` (失败 ${d.failed})` : ""}
+                </td>
+                <td>{tok(d.input)}</td>
+                <td>{d.input ? `${Math.round((d.cache_read / d.input) * 100)}%` : "—"}</td>
+                <td>{tok(d.output)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Card>
+  );
+}
+
 export default function DecisionsPage() {
   const [data, setData] = useState<AiData | null>(null);
   const [err, setErr] = useState("");
@@ -114,6 +155,8 @@ export default function DecisionsPage() {
 
   const rows = (data?.log || []).filter((r: any) => !quiet || outcome(r).kind !== "idle");
   return (
+    <>
+    <UsageCard />
     <Card
       title="决策记录"
       note="每次大模型调用一条，最近 20 次，最新在最上面。开关和运行方式在「交易策略」页"
@@ -143,5 +186,6 @@ export default function DecisionsPage() {
         <Empty>{data.log.length ? "没有需要关注的记录" : "还没有记录"}</Empty>
       )}
     </Card>
+    </>
   );
 }

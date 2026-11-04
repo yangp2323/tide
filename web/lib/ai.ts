@@ -66,4 +66,15 @@ export type AiData = {
   log: any[];
 };
 
+export type UsageDay = {
+  date: string;
+  calls: number;
+  failed: number;
+  by_source: Record<string, number>;
+  input: number;
+  cache_read: number;
+  cache_write: number;
+  output: number;
+};
+
 export const DEFAULT_MODEL: Record<string, string> = { anthropic: "claude-opus-5-5", openai: "deepseek-chat" };

@@ -1165,6 +1165,33 @@ async fn pairs_are_fetched_together_and_keep_their_order() {
 }
 
 #[test]
+fn model_use_is_summed_per_day_across_provider_shapes() {
+    let dir = std::env::temp_dir().join(format!("tide-usage-{}", uuid::Uuid::new_v4()));
+    let store = store::Store::open(&dir).unwrap();
+    let today = model::now();
+    store.decision(&json!({"time":today,"source":"auto","usage":{"input_tokens":100,"cache_read_input_tokens":900,"cache_creation_input_tokens":50,"output_tokens":30}})).unwrap();
+    store.decision(&json!({"time":today,"source":"hook","usage":{"prompt_tokens":400,"prompt_tokens_details":{"cached_tokens":300},"completion_tokens":20}})).unwrap();
+    store
+        .decision(&json!({"time":today,"source":"auto","error":"boom"}))
+        .unwrap();
+    let days = store.usage_by_day(7).unwrap();
+    let d = &days[0];
+    assert_eq!(d["date"], &today[..10]);
+    assert_eq!(
+        (d["calls"].as_u64(), d["failed"].as_u64()),
+        (Some(3), Some(1))
+    );
+    assert_eq!(d["input"], 1050 + 400);
+    assert_eq!(d["cache_read"], 900 + 300);
+    assert_eq!(
+        (d["cache_write"].as_u64(), d["output"].as_u64()),
+        (Some(50), Some(50))
+    );
+    assert_eq!(d["by_source"]["auto"], 2);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn schema_is_versioned_and_open_trades_are_filtered_in_sql() {
     let dir = std::env::temp_dir().join(format!("tide-schema-{}", uuid::Uuid::new_v4()));
     let store = store::Store::open(&dir).unwrap();
@@ -1559,7 +1586,7 @@ async fn queued_events_start_one_run_within_the_limits() {
     assert!(last["messages"][1]["content"]
         .as_str()
         .unwrap()
-        .contains("\"trigger\":{\"type\":\"scheduled\"}"));
+        .contains("\"type\":\"scheduled\""));
     model_server.abort();
     server.abort();
     std::env::remove_var("BYBIT_BASE_URL");

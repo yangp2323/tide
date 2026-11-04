@@ -312,3 +312,27 @@ pub fn mask(s: &str) -> Option<String> {
         })
     }
 }
+
+/// Tokens of one model call as (all input, input read from the cache, input written to the
+/// cache, output), whichever of the providers' usage shapes it came in. Anthropic reports
+/// cached input separately from `input_tokens`; OpenAI-style APIs include it in the total.
+pub fn token_use(u: &Value) -> (u64, u64, u64, u64) {
+    let n = |v: &Value| v.as_u64().unwrap_or(0);
+    let output = n(&u["output_tokens"]) + n(&u["completion_tokens"]);
+    if u.get("cache_read_input_tokens").is_some() || u.get("cache_creation_input_tokens").is_some()
+    {
+        let (read, write) = (
+            n(&u["cache_read_input_tokens"]),
+            n(&u["cache_creation_input_tokens"]),
+        );
+        return (n(&u["input_tokens"]) + read + write, read, write, output);
+    }
+    let cached = n(&u["prompt_tokens_details"]["cached_tokens"])
+        + n(&u["input_tokens_details"]["cached_tokens"]);
+    (
+        n(&u["prompt_tokens"]) + n(&u["input_tokens"]),
+        cached,
+        0,
+        output,
+    )
+}

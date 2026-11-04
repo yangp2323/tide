@@ -230,6 +230,7 @@ async fn handle(
             }
             "/api/ai/snapshot" => app.snapshot().await,
             "/api/ai/log" => Ok(json!(app.store.decisions(limit(q, 50, 500))?)),
+            "/api/ai/usage" => app.store.usage_by_day(limit(q, 14, 90) as i64),
             "/api/knowledge" => Ok(json!(app.store.knowledge()?)),
             "/api/stops" => app.store.stop_history(limit(q, 50, 500)),
             "/api/orders/pending" => Ok(json!(app.store.unresolved()?)),

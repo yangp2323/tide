@@ -321,6 +321,51 @@ impl Store {
         }
         Ok(())
     }
+    /// Model calls and token use per UTC day over the last `days` days, newest first. Tokens only:
+    /// what they cost depends on the model and the channel, which this does not know.
+    pub fn usage_by_day(&self, days: i64) -> Result<Value> {
+        let since = (chrono::Utc::now() - chrono::Duration::days(days.max(1) - 1))
+            .format("%Y-%m-%d 00:00:00")
+            .to_string();
+        let rows = {
+            let db = self.db.lock().unwrap();
+            let mut q = db.prepare(
+                "SELECT json_extract(data,'$.time'), json_extract(data,'$.source'), json_extract(data,'$.error') IS NOT NULL, json_extract(data,'$.usage') FROM decisions WHERE json_extract(data,'$.time') >= ?1",
+            )?;
+            let rows = q
+                .query_map([since], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        r.get::<_, bool>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let mut by_day = std::collections::BTreeMap::<String, Value>::new();
+        for (time, source, failed, usage) in rows {
+            let d = by_day.entry(time[..10].to_string()).or_insert_with(|| {
+                json!({"date":&time[..10],"calls":0,"failed":0,"by_source":{},"input":0,"cache_read":0,"cache_write":0,"output":0})
+            });
+            let add = |d: &mut Value, k: &str, n: u64| d[k] = json!(d[k].as_u64().unwrap_or(0) + n);
+            add(d, "calls", 1);
+            if failed {
+                add(d, "failed", 1);
+            }
+            let n = d["by_source"][&source].as_u64().unwrap_or(0) + 1;
+            d["by_source"][&source] = json!(n);
+            if let Some(u) = usage.and_then(|u| serde_json::from_str::<Value>(&u).ok()) {
+                let (input, read, write, output) = crate::model::token_use(&u);
+                add(d, "input", input);
+                add(d, "cache_read", read);
+                add(d, "cache_write", write);
+                add(d, "output", output);
+            }
+        }
+        Ok(json!(by_day.into_values().rev().collect::<Vec<_>>()))
+    }
     pub fn decisions(&self, limit: usize) -> Result<Vec<Value>> {
         let db = self.db.lock().unwrap();
         let mut q = db.prepare("SELECT data FROM decisions ORDER BY id DESC LIMIT ?")?;
