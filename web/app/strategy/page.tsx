@@ -7,7 +7,7 @@ import { useOv } from "@/lib/store";
 import { Card, Empty, MsgBox, Skeleton, useAction } from "@/lib/ui";
 
 type Market = "spot" | "futures";
-type Draft = { market: Market; leverage: number; short: boolean; max_open: number; pairs: string[] };
+type Draft = { market: Market; leverage: number; short: boolean; max_open: number; risk_per_trade_pct: number; pairs: string[] };
 type Row = {
   pair: string;
   base: string;
@@ -37,9 +37,10 @@ export default function StrategyPage() {
       leverage: d.leverage ?? 1,
       short: !!d.short,
       max_open: d.max_open ?? 3,
+      risk_per_trade_pct: d.risk_per_trade_pct ?? 1,
       pairs: d.pairs ?? [],
     }),
-    [d.market, d.leverage, d.short, d.max_open, d.pairs],
+    [d.market, d.leverage, d.short, d.max_open, d.risk_per_trade_pct, d.pairs],
   );
 
   const savedRef = useRef(saved);
@@ -50,7 +51,10 @@ export default function StrategyPage() {
   const maxPairs = d.max_pairs ?? 12;
   const maxOpen = d.max_open_limit ?? 5;
   const maxLev = d.max_leverage ?? 25;
-  const priceStop = d.price_stop ?? 0.08;
+  // 止损为 2.5×ATR，限制在 2%–10%；系统按止损距离逐笔下调杠杆，使止损不超过强平距离的 60%。
+  const stopLo = 0.02;
+  const stopHi = 0.1;
+  const levFor = (stop: number) => Math.max(1, Math.min(cur.leverage, Math.floor(0.6 / stop + 1e-9)));
 
   const loadingMk = useRef<Set<string>>(new Set());
 
@@ -98,6 +102,7 @@ export default function StrategyPage() {
       }
       next.max_open = clamp(next.max_open || 1, 1, maxOpen);
       next.leverage = clamp(next.leverage || 1, 1, maxLev);
+      next.risk_per_trade_pct = clamp(Math.round((next.risk_per_trade_pct || 1) * 10) / 10, 0.1, 5);
       return next;
     });
   }
@@ -115,6 +120,7 @@ export default function StrategyPage() {
     if (a.leverage !== b.leverage && b.market === "futures") out.push(`杠杆 ${a.leverage}× → ${b.leverage}×`);
     if (a.short !== b.short && b.market === "futures") out.push(b.short ? "开启做空" : "关闭做空");
     if (a.max_open !== b.max_open) out.push(`持仓 ${a.max_open} → ${b.max_open} 笔`);
+    if (a.risk_per_trade_pct !== b.risk_per_trade_pct) out.push(`每笔风险 ${a.risk_per_trade_pct}% → ${b.risk_per_trade_pct}%`);
     if (a.market === b.market) {
       const sa = new Set(a.pairs);
       const sb = new Set(b.pairs);
@@ -140,10 +146,10 @@ export default function StrategyPage() {
 
   async function save() {
     const ch = changes();
-    if (fut && cur.leverage >= 5) {
+    if ((fut && cur.leverage >= 5) || cur.risk_per_trade_pct > 2) {
       const ok = await confirm({
-        title: `确定用 ${cur.leverage} 倍杠杆？`,
-        body: priceStop * cur.leverage >= 1 ? "当前杠杆下，仓位可能在价格触及 8% 止损前被强平。" : `价格触及止损时，理论亏损约为这笔保证金的 ${Math.round(priceStop * cur.leverage * 100)}%（不含费用和滑点）。`,
+        title: cur.risk_per_trade_pct > 2 ? `确定每笔承担 ${cur.risk_per_trade_pct}% 风险？` : `确定用最高 ${cur.leverage} 倍杠杆？`,
+        body: `每次止损约亏总资金的 ${cur.risk_per_trade_pct}%（不含费用和滑点），${cur.max_open} 笔同时止损约亏 ${(cur.risk_per_trade_pct * cur.max_open).toFixed(1)}%。杠杆只影响占用的保证金，系统会按止损距离逐笔下调，保证止损先于强平。`,
         ok: "确定",
         danger: true,
       });
@@ -180,14 +186,14 @@ export default function StrategyPage() {
   if (!query && rows0) list = [...rows0.filter((m) => sel.has(m.pair) && !list.includes(m)), ...list];
 
   const warn: string[] = [];
+  if (cur.risk_per_trade_pct * cur.max_open > 6)
+    warn.push(`${cur.max_open} 笔同时止损约亏总资金的 ${(cur.risk_per_trade_pct * cur.max_open).toFixed(1)}%，超过一般建议的 6%。`);
   if (fut && cur.leverage >= 5)
-    warn.push(
-      priceStop * cur.leverage >= 1 ? `${cur.leverage} 倍杠杆下，仓位可能在价格触及 8% 止损前被强平，止损不保证先执行。` : `${cur.leverage} 倍杠杆下，价格触及止损时的理论亏损约为保证金的 ${Math.round(priceStop * cur.leverage * 100)}%（不含费用和滑点）。`,
-    );
+    warn.push(`跳空或滑点可能让止损成交价比触发价更差；杠杆越高，留给止损的空间越小。`);
   const ch = changes();
   return (
     <>
-      <Card title="交易配置" note="AI 交易 · 4 小时行情 · 价格反向 8% 止损">
+      <Card title="交易配置" note="AI 交易 · 4 小时行情 · 2.5×ATR 止损">
         <div className="fields">
           <div className="field">
             <b>市场</b>
@@ -214,7 +220,7 @@ export default function StrategyPage() {
             <div className="lev-top">
               <b>{cur.leverage}×</b>
               <span>
-                {!fut ? "现货没有杠杆" : cur.leverage === 1 ? "不加杠杆" : cur.leverage <= 3 ? `盈亏放大 ${cur.leverage} 倍` : "风险很高"}
+                {!fut ? "现货没有杠杆" : cur.leverage === 1 ? "不加杠杆" : "上限，系统按止损距离逐笔下调"}
               </span>
             </div>
             <input
@@ -235,12 +241,12 @@ export default function StrategyPage() {
             </div>
             <div className="risk">
               <div>
-                <span>价格触及止损时的理论亏损</span>
-                <b className={cur.leverage > 3 ? "down" : ""}>{fut && priceStop * cur.leverage >= 1 ? "可能先强平" : `${Math.round(priceStop * cur.leverage * 100)}%`}</b>
+                <span>实际杠杆（止损 2% → 10%）</span>
+                <b>{fut ? `${levFor(stopLo)}× → ${levFor(stopHi)}×` : "1×"}</b>
               </div>
               <div>
                 <span>价格反向多少会爆仓</span>
-                <b>{fut ? `约 ${(100 / cur.leverage).toFixed(1)}%` : "不会爆仓"}</b>
+                <b>{fut ? `约 ${(100 / levFor(stopLo)).toFixed(1)}% 起，止损先触发` : "不会爆仓"}</b>
               </div>
             </div>
           </div>
@@ -274,7 +280,25 @@ export default function StrategyPage() {
                 笔
               </span>
             </div>
-            <p>这是持仓数量上限，不要求开满。预留 5% 资金后，按剩余名额与资金能支持的笔数分配；最低下单金额和数量以交易所对该币种的要求为准。</p>
+            <p>这是持仓数量上限，不要求开满。每笔保证金不超过预留 5% 后按剩余名额平分的资金。</p>
+            <div style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+              <span className="muted" style={{ fontSize: 13 }}>
+                每笔最多亏
+              </span>
+              <span className="stepper">
+                <button aria-label="减少" onClick={() => update({ risk_per_trade_pct: cur.risk_per_trade_pct - (cur.risk_per_trade_pct > 1 ? 0.5 : 0.1) })}>
+                  −
+                </button>
+                <output>{cur.risk_per_trade_pct}%</output>
+                <button aria-label="增加" onClick={() => update({ risk_per_trade_pct: cur.risk_per_trade_pct + (cur.risk_per_trade_pct >= 1 ? 0.5 : 0.1) })}>
+                  +
+                </button>
+              </span>
+              <span className="muted" style={{ fontSize: 13 }}>
+                总资金
+              </span>
+            </div>
+            <p>仓位按「每笔风险 ÷ 止损距离」计算：止损越宽，仓位越小，止损时亏损都约为总资金的这个比例。资金太少达不到交易所最低下单额时不会开仓。</p>
           </div>
         </div>
         {warn.length > 0 && (

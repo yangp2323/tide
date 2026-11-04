@@ -344,6 +344,40 @@ impl Bybit {
             base_fee,
         })
     }
+    /// Net USDT funding for a linear symbol since `start` (ms): negative is paid, positive received.
+    /// The transaction log allows at most 7 days per query, so the range is walked in windows.
+    pub async fn funding(&self, pair: &str, start: i64) -> Result<f64> {
+        const WEEK: i64 = 7 * 86_400_000;
+        let sym = symbol(pair);
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut from = start.max(now - 2 * 365 * 86_400_000);
+        let mut total = 0.0;
+        while from < now {
+            let to = (from + WEEK).min(now);
+            let mut cursor = String::new();
+            loop {
+                let mut args = json!({"accountType":"UNIFIED","category":"linear","currency":"USDT","type":"SETTLEMENT","startTime":from,"endTime":to,"limit":50});
+                if !cursor.is_empty() {
+                    args["cursor"] = json!(cursor);
+                }
+                let v = self.get("/v5/account/transaction-log", args, true).await?;
+                total += v["list"]
+                    .as_array()
+                    .context("资金费记录无效")?
+                    .iter()
+                    .filter(|e| e["symbol"] == sym)
+                    .map(|e| num(&e["funding"]))
+                    .sum::<f64>();
+                let next = v["nextPageCursor"].as_str().unwrap_or("");
+                if next.is_empty() || next == cursor {
+                    break;
+                }
+                cursor = next.into();
+            }
+            from = to;
+        }
+        Ok(total)
+    }
     pub async fn confirm(&self, market: &str, pair: &str, link: &str) -> Result<Option<Fill>> {
         let Some(o) = self.lookup(market, pair, link).await? else {
             return Ok(None);

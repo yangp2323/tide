@@ -90,6 +90,8 @@ pub fn run(store: &Store, old: &Path) -> Result<()> {
                 enter_tag: v["enter_tag"].as_str().unwrap_or("trend").into(),
                 exit_reason: v["exit_reason"].as_str().map(str::to_string),
                 entry_fee: 0.0,
+                stop_dist: 0.0,
+                funding: 0.0,
             });
         }
     }

@@ -1,5 +1,5 @@
 use crate::{
-    engine::{realized, usdt},
+    engine::stop_distance,
     indicators,
     model::{now, num, AiConfig, Config},
     App,
@@ -10,23 +10,18 @@ use std::sync::Arc;
 
 const SYSTEM: &str = r#"You manage a Bybit crypto account. Your primary objective is to grow account equity through positive expected net profit over repeated trades, accounting for fees, slippage and funding costs where applicable. Actively seek evidence-backed long and short opportunities within the supplied risk limits. Evaluate entries, holding and exits by their expected future return; do not make breaking even on a position the objective. Do not force trades when the evidence does not support positive expected net profit, and do not invent unavailable cost estimates or imply guaranteed returns.
 Use only the supplied closed candles and account snapshot. Return only a JSON object {"analysis":"简体中文分析","actions":[{"action":"open_long|open_short|close","pair":"exact pair from snapshot","confidence":0.0,"reason":"简体中文理由"}]}. Explain the opportunity or lack of opportunity using specific supplied trend, momentum, volatility and price signals, including the expected direction and what would invalidate the thesis. For each action, explain how it serves the net profit objective. When actions is empty, explain the missing market evidence or binding constraint. Passing a risk check, such as remaining below the daily loss limit, is eligibility to trade and is not evidence of a profitable opportunity.
-Respect whitelist, concurrent position slots, daily loss and min confidence. Closed positions release slots and can be replaced by new longs or shorts; there is no daily entry count limit. Do not add to existing positions. Shorts only when short_allowed. System sizes positions and enforces an 8% price stop, trailing 3% after a 6% price gain. Confidence must be finite and between 0 and 1."#;
+Respect whitelist, concurrent position slots, daily loss and min confidence. Closed positions release slots and can be replaced by new longs or shorts; there is no daily entry count limit. Do not add to existing positions. Shorts only when short_allowed. System sizes each position so a stop-out loses about risk_per_trade_pct of equity, sets the stop at 2.5 × ATR(14) of the 4h candles (2% to 10% of price), lowers leverage per trade so the stop stays well ahead of liquidation, and trails the stop by half that distance once price has moved one stop distance in favor. The daily loss check counts realized PnL plus open floating losses. Confidence must be finite and between 0 and 1."#;
 
 impl App {
     pub async fn snapshot(&self) -> Result<Value> {
         let c = self.store.config()?;
         let ex = self.exchange(&c);
-        let wallet = ex.wallet().await?;
-        let (mut equity, _) = usdt(&wallet);
-        let pnl = realized(&self.store.trades()?, true);
         let held = self.store.open_trades()?;
+        let (equity, _, pnl) = self.account_risk(&ex, &held).await?;
         let mut positions = vec![];
         let mut pairs = vec![];
         for t in &held {
             let price = ex.price(&t.market, &t.pair).await?;
-            if t.market == "spot" {
-                equity += t.amount * price;
-            }
             positions.push(json!({"pair":t.pair,"side":if t.is_short{"short"}else{"long"},"open_rate":t.open_rate,"current_rate":price,"profit_pct":num(&t.mark(price)["profit_ratio"])*100.0,"stop_loss_rate":t.stop_loss_abs,"opened_utc":t.open_date,"entry_tag":t.enter_tag}));
         }
         for p in &c.pairs {
@@ -57,12 +52,17 @@ impl App {
                     ])
                 })
                 .collect();
-            pairs.push(json!({"pair":p,"columns":["date","open","high","low","close","volume","ema20","ema50","ema200","adx","rsi","atr"],"candles":rows}));
+            let last = (cs.last(), xs.last());
+            let stop = match last {
+                (Some(c), Some(x)) => stop_distance(x.atr, c.close),
+                _ => None,
+            };
+            pairs.push(json!({"pair":p,"stop_loss_price_pct":stop.map(|d| d * 100.0),"columns":["date","open","high","low","close","volume","ema20","ema50","ema200","adx","rsi","atr"],"candles":rows}));
         }
         Ok(
             json!({"time_utc":now(),"exchange":"bybit","market":c.market,"timeframe":"4h","leverage":c.leverage,"short_allowed":c.market=="futures"&&c.short,"bot_state":if c.running{"running"}else{"stopped"},
-            "account":{"equity_usdt":equity,"realized_pnl_today_usdt":pnl,"realized_pnl_today_pct":if equity-pnl>0.0{pnl/(equity-pnl)*100.0}else{0.0}},
-            "risk_limits":{"max_open":c.max_open,"slots_left":c.max_open.saturating_sub(held.len()),"max_daily_loss_pct":c.ai.max_daily_loss_pct,"min_confidence":c.ai.min_confidence,"stop_loss_price_pct":8.0},"open_positions":positions,"pairs":pairs}),
+            "account":{"equity_usdt":equity,"pnl_today_with_floating_loss_usdt":pnl,"pnl_today_with_floating_loss_pct":if equity-pnl>0.0{pnl/(equity-pnl)*100.0}else{0.0}},
+            "risk_limits":{"max_open":c.max_open,"slots_left":c.max_open.saturating_sub(held.len()),"max_daily_loss_pct":c.ai.max_daily_loss_pct,"min_confidence":c.ai.min_confidence,"risk_per_trade_pct":c.risk_per_trade_pct,"max_leverage":c.leverage},"open_positions":positions,"pairs":pairs}),
         )
     }
     pub async fn execute_actions(&self, actions: &[Value], external: bool) -> Result<Vec<Value>> {
@@ -282,7 +282,7 @@ pub fn validate_model_options(ai: &AiConfig) -> Result<()> {
     if ai.claude_thinking == "enabled" {
         ensure!(
             (1024..16000).contains(&ai.claude_thinking_budget),
-            "Claude 手动思考预算须为 1024–15999 tokens，小于总输出上限 16000"
+            "Claude 手动思考预算须为 1024–15999 tokens"
         );
     }
     ensure!(
@@ -326,7 +326,7 @@ fn model_request(ai: &AiConfig, snap: &Value) -> Result<(String, Value)> {
         } else {
             format!("{}/v1/messages", base)
         };
-        let mut body = json!({"model":ai.model,"stream":false,"max_tokens":16000,"system":SYSTEM,"messages":[{"role":"user","content":user}]});
+        let mut body = json!({"model":ai.model,"stream":false,"max_tokens":32000,"system":SYSTEM,"messages":[{"role":"user","content":user}]});
         match ai.claude_thinking.as_str() {
             "adaptive" => body["thinking"] = json!({"type":"adaptive"}),
             "enabled" => {
@@ -388,7 +388,15 @@ fn parse_model_response(v: &Value) -> Result<(String, Value)> {
             Some("incomplete" | "failed" | "cancelled" | "queued" | "in_progress")
         ) && v["choices"][0]["finish_reason"] != "length"
             && v["stop_reason"] != "max_tokens",
-        "模型输出未完成，未执行交易"
+        "模型输出未完成，未执行交易（{}，已输出 {} tokens）。思考等级过高时思考会用完输出上限，可调低思考等级",
+        [&v["stop_reason"], &v["choices"][0]["finish_reason"], &v["incomplete_details"]["reason"], &v["status"]]
+            .into_iter()
+            .find_map(|x| x.as_str())
+            .unwrap_or("unknown"),
+        [&v["usage"]["output_tokens"], &v["usage"]["completion_tokens"]]
+            .into_iter()
+            .find_map(|x| x.as_u64())
+            .map_or("?".into(), |n| n.to_string())
     );
     ensure!(
         v["choices"][0]["message"]["refusal"].as_str().is_none(),
@@ -740,7 +748,7 @@ mod model_tests {
                             body["thinking"],
                             json!({"type":"enabled","budget_tokens":4096})
                         );
-                        assert_eq!(body["max_tokens"], 16000);
+                        assert_eq!(body["max_tokens"], 32000);
                         assert!(body.get("output_config").is_none());
                     }
                     "test-disabled" => {

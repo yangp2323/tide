@@ -9,8 +9,10 @@ use std::future::IntoFuture;
 
 #[test]
 fn capital_limit_does_not_require_funding_all_slots() {
-    let mut cfg = model::Config::default();
-    cfg.max_open = 5;
+    let mut cfg = model::Config {
+        max_open: 5,
+        ..model::Config::default()
+    };
     for capital in [0.5, 6.0, 20.0] {
         cfg.capital = Some(capital);
         api::validate(&cfg).unwrap();
@@ -66,6 +68,11 @@ async fn bybit(State(mock): State<Arc<Mutex<Mock>>>, req: Request) -> axum::resp
             json!({"list":[{"status":"Trading","lotSizeFilter":{"basePrecision":"0.01","minOrderAmt":"5","minOrderQty":"0.01","maxMarketOrderQty":"1000"}}]})
         }
         "/v5/market/tickers" => json!({"list":[{"lastPrice":"10"}]}),
+        "/v5/market/kline" => {
+            // Flat 4h candles with a 0.1 range: ATR 0.1, so the stop is 2.5% at price 10.
+            let end = chrono::Utc::now().timestamp_millis() / 14_400_000 * 14_400_000 - 14_400_000;
+            json!({"list":(0..300).map(|i| json!([(end - i * 14_400_000).to_string(),"10","10.05","9.95","10","1"])).collect::<Vec<_>>()})
+        }
         "/v5/order/create" => {
             mock.count += 1;
             let id = format!("order{}", mock.count);
@@ -118,6 +125,8 @@ async fn execution_is_durable_and_closing_releases_position_slots() {
     // The exchange accepts 5 USDT; concurrent holdings, not past entries, limit trading.
     cfg.capital = Some(6.0);
     cfg.max_open = 1;
+    // 5% of 6 USDT at a 2.5% stop wants 12 USDT; the 95% budget cap limits it to 5.7.
+    cfg.risk_per_trade_pct = 5.0;
     api::validate(&cfg).unwrap();
     cfg.exchange = model::Credentials {
         key: "test".into(),
@@ -152,6 +161,8 @@ async fn execution_is_durable_and_closing_releases_position_slots() {
     let held = app.store.open_trades().unwrap();
     assert_eq!(held.len(), 1);
     assert!((held[0].stake_amount - 5.7).abs() < 1e-8);
+    assert!((held[0].stop_dist - 0.025).abs() < 1e-9);
+    assert!((held[0].stop_loss_abs - 9.75).abs() < 1e-9);
     let response = api::dispatch(
         State(app.clone()),
         Request::builder()

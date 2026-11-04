@@ -1,5 +1,6 @@
 use crate::{
     exchange::{category, quantize, symbol, Bybit, Fill},
+    indicators,
     model::{day, now, num, Config, Trade},
     App,
 };
@@ -61,7 +62,35 @@ pub fn entry_stake(budget: f64, slots: usize, minimum: f64) -> Option<f64> {
     Some(usable / affordable as f64)
 }
 
+/// Initial stop: 2.5 × ATR(14) of the 4h candles, kept between 2% and 10% of price.
+pub fn stop_distance(atr: f64, price: f64) -> Option<f64> {
+    let d = 2.5 * atr / price;
+    (d.is_finite() && d > 0.0).then(|| d.clamp(0.02, 0.10))
+}
+/// Lower the per-trade leverage until the stop sits at most 60% of the way to the
+/// isolated-margin liquidation price (about 1 / leverage), so the stop triggers first.
+pub fn trade_leverage(max: u32, stop: f64) -> u32 {
+    ((0.6 / stop + 1e-9).floor() as u32).clamp(1, max.max(1))
+}
+/// Margin that loses `risk_pct` percent of `equity` if the stop is hit (before fees and slippage).
+pub fn risk_stake(equity: f64, risk_pct: f64, stop: f64, leverage: u32) -> f64 {
+    equity * risk_pct / 100.0 / stop / leverage as f64
+}
+/// Trailing starts once the price moved one stop distance in favor, then trails by half of it.
+/// Trades opened before ATR stops keep the former fixed 6% / 3% rule.
+pub fn trail_params(t: &Trade) -> (f64, f64) {
+    if t.stop_dist > 0.0 {
+        (t.stop_dist, t.stop_dist / 2.0)
+    } else {
+        (0.06, 0.03)
+    }
+}
+/// Today's PnL for the daily loss limit: realized today plus every open position's floating loss.
+pub fn daily_pnl(realized_today: f64, unrealized: &[f64]) -> f64 {
+    realized_today + unrealized.iter().map(|u| u.min(0.0)).sum::<f64>()
+}
 pub fn stop_price(t: &Trade, price: f64) -> (f64, f64) {
+    let (activate, trail) = trail_params(t);
     let peak = if t.is_short {
         t.peak.min(price)
     } else {
@@ -72,11 +101,11 @@ pub fn stop_price(t: &Trade, price: f64) -> (f64, f64) {
     } else {
         (peak - t.open_rate) / t.open_rate
     };
-    let stop = if favorable >= 0.06 {
+    let stop = if favorable >= activate {
         if t.is_short {
-            t.stop_loss_abs.min(peak * 1.03)
+            t.stop_loss_abs.min(peak * (1.0 + trail))
         } else {
-            t.stop_loss_abs.max(peak * 0.97)
+            t.stop_loss_abs.max(peak * (1.0 - trail))
         }
     } else {
         t.stop_loss_abs
@@ -131,7 +160,8 @@ impl App {
             t.peak = fill.price;
             t.stake_amount = fill.qty * fill.price / t.leverage as f64;
             t.entry_fee = fill.fee;
-            t.stop_loss_abs = fill.price * if t.is_short { 1.08 } else { 0.92 };
+            let d = if t.stop_dist > 0.0 { t.stop_dist } else { 0.08 };
+            t.stop_loss_abs = fill.price * if t.is_short { 1.0 + d } else { 1.0 - d };
             self.store.insert_trade(t.clone(), link)?;
             self.store.log(
                 "INFO",
@@ -146,6 +176,11 @@ impl App {
                 .find(|x| x.trade_id == t.trade_id)
                 .context("平仓订单对应的持仓不存在")?;
             t = current;
+            let funding_total = if t.market == "futures" {
+                self.funding_since_open(&t).await
+            } else {
+                0.0
+            };
             ensure!(
                 fill.qty <= t.amount * (1.0 + 1e-8),
                 "平仓成交数量大于已记录持仓，停止核对"
@@ -161,10 +196,14 @@ impl App {
             } else {
                 (fill.qty / t.amount).min(1.0)
             };
+            // Funding settles on the whole position; the closed slice takes its share of
+            // whatever earlier partial closes have not booked yet.
+            let funding = (funding_total - t.funding) * fraction;
             let mut remaining = t.clone();
             remaining.amount -= fill.qty;
             remaining.stake_amount *= 1.0 - fraction;
             remaining.entry_fee *= 1.0 - fraction;
+            remaining.funding += funding;
             let dust_value = if dust {
                 (t.amount - fill.qty) * t.open_rate
             } else {
@@ -180,6 +219,7 @@ impl App {
             t.amount = fill.qty;
             t.stake_amount *= fraction;
             t.entry_fee *= fraction;
+            t.funding = funding;
             t.close_rate = Some(fill.price);
             t.close_date = Some(now());
             t.exit_reason = Some(
@@ -192,7 +232,8 @@ impl App {
                 (fill.price - t.open_rate) * fill.qty * if t.is_short { -1.0 } else { 1.0 }
                     - t.entry_fee
                     - fill.fee
-                    - dust_value;
+                    - dust_value
+                    + funding;
             t.profit_ratio = t.profit_abs / t.stake_amount;
             self.store.settle_exit(
                 &t,
@@ -212,6 +253,40 @@ impl App {
             );
         }
         Ok(())
+    }
+    /// Funding paid (negative) or received since the trade opened. A lookup failure must not
+    /// block settlement, so it is logged and only the already booked funding is kept.
+    async fn funding_since_open(&self, t: &Trade) -> f64 {
+        let result: Result<f64> = async {
+            let opened = chrono::NaiveDateTime::parse_from_str(&t.open_date, "%Y-%m-%d %H:%M:%S")?
+                .and_utc()
+                .timestamp_millis();
+            self.exchange(&self.store.config()?)
+                .funding(&t.pair, opened)
+                .await
+        }
+        .await;
+        result.unwrap_or_else(|e| {
+            self.store.log(
+                "WARNING",
+                &format!("{} 资金费读取失败，未计入盈亏：{}", t.pair, e),
+            );
+            t.funding
+        })
+    }
+    /// Account equity (spot holdings at market), free USDT and today's PnL for the loss limit.
+    pub async fn account_risk(&self, ex: &Bybit, held: &[Trade]) -> Result<(f64, f64, f64)> {
+        let (mut equity, free) = usdt(&ex.wallet().await?);
+        let mut unrealized = vec![];
+        for t in held {
+            let price = ex.price(&t.market, &t.pair).await?;
+            if t.market == "spot" {
+                equity += t.amount * price;
+            }
+            unrealized.push(num(&t.mark(price)["profit_abs"]));
+        }
+        let pnl = daily_pnl(realized(&self.store.trades()?, true), &unrealized);
+        Ok((equity, free, pnl))
     }
     pub async fn reconcile(&self, c: &Config) -> Result<()> {
         let ex = self.exchange(c);
@@ -269,15 +344,8 @@ impl App {
             "有待核对订单，禁止继续开仓"
         );
         let ex = self.exchange(&c);
-        let wallet = ex.wallet().await?;
-        let (mut equity, free) = usdt(&wallet);
-        let trades = self.store.trades()?;
         let held = self.store.open_trades()?;
-        for t in &held {
-            if t.market == "spot" {
-                equity += t.amount * ex.price(&t.market, &t.pair).await?;
-            }
-        }
+        let (equity, free, pnl) = self.account_risk(&ex, &held).await?;
         ensure!(
             self.store
                 .state("risk_error")?
@@ -286,16 +354,7 @@ impl App {
             "持仓核对异常，暂停新开仓；请查看运行日志"
         );
         let ai = tag != "trend";
-        entry_guard(
-            &c,
-            &held,
-            realized(&trades, true),
-            equity,
-            pair,
-            short,
-            confidence,
-            ai,
-        )?;
+        entry_guard(&c, &held, pnl, equity, pair, short, confidence, ai)?;
         let ins = ex.instrument(&c.market, pair).await?;
         let price = ex.price(&c.market, pair).await?;
         let used: f64 = held.iter().map(|t| t.stake_amount).sum();
@@ -305,7 +364,17 @@ impl App {
             free
         };
         let futures = c.market == "futures";
-        let leverage = if futures { c.leverage } else { 1 };
+        let candles = ex.candles(&c.market, pair, 240, 300, None).await?;
+        ensure!(candles.len() >= 30, "{} K 线不足，无法计算 ATR 止损", pair);
+        let atr = indicators::calculate(&candles)
+            .last()
+            .map_or(0.0, |x| x.atr);
+        let stop = stop_distance(atr, price).context("ATR 无效，无法计算止损")?;
+        let leverage = if futures {
+            trade_leverage(c.leverage, stop)
+        } else {
+            1
+        };
         if futures {
             let account = ex.get("/v5/account/info", json!({}), true).await?;
             ensure!(
@@ -363,8 +432,17 @@ impl App {
             .max(num(&ins["lotSizeFilter"]["minOrderQty"]))
             .max(qty_step);
         let min_stake = (min_qty / qty_step).ceil() * qty_step * price / leverage as f64;
-        let stake = entry_stake(budget, c.max_open - held.len(), min_stake)
+        let cap = entry_stake(budget, c.max_open - held.len(), min_stake)
             .context("可用预算预留 5% 后不足该交易对的最小下单要求")?;
+        let base = c.capital.map_or(equity, |cap| cap.min(equity));
+        let wanted = risk_stake(base, c.risk_per_trade_pct, stop, leverage);
+        ensure!(
+            wanted.is_finite() && wanted >= min_stake,
+            "按每笔 {}% 风险、{:.1}% 止损计算的仓位低于交易所最小下单额",
+            c.risk_per_trade_pct,
+            stop * 100.0
+        );
+        let stake = wanted.min(cap);
         let qty = quantize(stake * leverage as f64 / price, step)?;
         let amount: f64 = qty.parse()?;
         ensure!(
@@ -395,11 +473,13 @@ impl App {
             close_date: None,
             profit_abs: 0.0,
             profit_ratio: 0.0,
-            stop_loss_abs: price * if short { 1.08 } else { 0.92 },
+            stop_loss_abs: price * if short { 1.0 + stop } else { 1.0 - stop },
             peak: price,
             enter_tag: tag.into(),
             exit_reason: None,
             entry_fee: 0.0,
+            stop_dist: stop,
+            funding: 0.0,
         };
         let mut body = json!({"category":category(&c.market),"symbol":symbol(pair),"side":if short{"Sell"}else{"Buy"},"orderType":"Market","qty":qty,"orderLinkId":link});
         if futures {
@@ -618,7 +698,7 @@ impl App {
             if t.market == "spot" && price <= stop {
                 self.close_position(
                     t.trade_id,
-                    if peak >= t.open_rate * 1.06 {
+                    if peak >= t.open_rate * (1.0 + trail_params(&t).0) {
                         "trailing_stop_loss"
                     } else {
                         "stop_loss"
@@ -675,6 +755,85 @@ mod tests {
         assert_eq!(entry_stake(f64::NAN, 3, 5.0), None);
         assert_eq!(entry_stake(f64::INFINITY, 3, 5.0), None);
         assert_eq!(entry_stake(100.0, 3, f64::NAN), None);
+    }
+
+    #[test]
+    fn atr_stop_stays_ahead_of_liquidation() {
+        assert_eq!(stop_distance(0.2, 10.0), Some(0.05));
+        assert_eq!(stop_distance(0.01, 10.0), Some(0.02));
+        assert_eq!(stop_distance(1.0, 10.0), Some(0.10));
+        assert_eq!(stop_distance(0.0, 10.0), None);
+        assert_eq!(stop_distance(f64::NAN, 10.0), None);
+        for max in 1..=25 {
+            for stop in [0.02, 0.035, 0.05, 0.08, 0.10] {
+                let lev = trade_leverage(max, stop);
+                assert!(lev >= 1 && lev <= max);
+                // The stop must be well inside the ~1/leverage liquidation distance.
+                assert!(stop <= 0.6 / lev as f64 + 1e-12, "{} {}", max, stop);
+            }
+        }
+        assert_eq!(trade_leverage(25, 0.05), 12);
+        assert_eq!(trade_leverage(3, 0.05), 3);
+        assert_eq!(trade_leverage(25, 0.10), 6);
+    }
+
+    #[test]
+    fn risk_sizing_and_daily_loss_include_floating_losses() {
+        // 1% of 1000 at a 5% stop is 200 notional: 200 margin at 1×, 40 at 5×.
+        assert!((risk_stake(1000.0, 1.0, 0.05, 1) - 200.0).abs() < 1e-9);
+        assert!((risk_stake(1000.0, 1.0, 0.05, 5) - 40.0).abs() < 1e-9);
+        assert_eq!(daily_pnl(-1.0, &[-3.0, 2.0]), -4.0);
+        assert_eq!(daily_pnl(0.0, &[5.0]), 0.0);
+        let mut c = Config {
+            running: true,
+            ..Config::default()
+        };
+        c.ai.enabled = true;
+        // Realized flat, but a 6% floating loss blocks new AI entries at the 5% limit.
+        let pnl = daily_pnl(0.0, &[-6.0]);
+        assert!(entry_guard(&c, &[], pnl, 94.0, "BTC/USDT", false, Some(0.9), true).is_err());
+    }
+
+    #[test]
+    fn trailing_uses_the_trade_stop_distance() {
+        let mut t = Trade {
+            trade_id: 1,
+            pair: "BTC/USDT".into(),
+            market: "spot".into(),
+            is_short: false,
+            leverage: 1,
+            amount: 1.0,
+            open_rate: 100.0,
+            stake_amount: 100.0,
+            open_date: now(),
+            close_rate: None,
+            close_date: None,
+            profit_abs: 0.0,
+            profit_ratio: 0.0,
+            stop_loss_abs: 95.0,
+            peak: 100.0,
+            enter_tag: "ai".into(),
+            exit_reason: None,
+            entry_fee: 0.0,
+            stop_dist: 0.05,
+            funding: 0.0,
+        };
+        assert_eq!(stop_price(&t, 104.0), (104.0, 95.0));
+        let (peak, stop) = stop_price(&t, 110.0);
+        assert_eq!(peak, 110.0);
+        assert!((stop - 107.25).abs() < 1e-9);
+        t.is_short = true;
+        t.peak = 100.0;
+        t.stop_loss_abs = 105.0;
+        let (_, stop) = stop_price(&t, 90.0);
+        assert!((stop - 92.25).abs() < 1e-9);
+        // Legacy trades without a recorded distance keep 6% / 3%.
+        t.is_short = false;
+        t.stop_dist = 0.0;
+        t.peak = 100.0;
+        t.stop_loss_abs = 92.0;
+        let (_, stop) = stop_price(&t, 106.0);
+        assert!((stop - 102.82).abs() < 1e-9);
     }
 
     #[test]

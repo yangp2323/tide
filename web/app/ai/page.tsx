@@ -205,7 +205,7 @@ export default function AiPage() {
       <div className="grid g2">
         <Card title="AI 交易" right={<StateLabel on={on}>{on ? "运行中" : "未开启"}</StateLabel>}>
           <p className="hint">
-            开启后，<b>所有自动开平仓都由大模型决定</b>，按设定间隔分析行情和持仓。每笔金额、杠杆、价格反向 8%
+            开启后，<b>所有自动开平仓都由大模型决定</b>，按设定间隔分析行情和持仓。每笔金额（按风险比例）、杠杆、2.5×ATR
             止损、移动止盈仍由系统执行，大模型改不了。
           </p>
           <div className="risk" style={{ marginTop: 12 }}>
@@ -314,7 +314,7 @@ export default function AiPage() {
                     <div className="ai-budget">
                       <label className="f" htmlFor="claudeBudget">手动思考预算（tokens）</label>
                       <input id="claudeBudget" type="number" min={1024} max={15999} step={1} value={claudeBudget} onChange={(e) => setClaudeBudget(+e.target.value)} />
-                      <p className="hint">范围 1024–15999；与最终回答共用 16000 tokens 总输出上限。</p>
+                      <p className="hint">范围 1024–15999；与最终回答共用 32000 tokens 总输出上限。</p>
                     </div>
                   )}
                 </div>

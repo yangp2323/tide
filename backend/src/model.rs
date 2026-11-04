@@ -10,6 +10,8 @@ pub struct Config {
     pub leverage: u32,
     pub short: bool,
     pub capital: Option<f64>,
+    /// Maximum loss per trade at its stop, as a percentage of trading equity.
+    pub risk_per_trade_pct: f64,
     pub running: bool,
     pub ai: AiConfig,
     pub exchange: Credentials,
@@ -24,6 +26,7 @@ impl Default for Config {
             leverage: 1,
             short: false,
             capital: None,
+            risk_per_trade_pct: 1.0,
             running: false,
             ai: AiConfig::default(),
             exchange: Credentials::default(),
@@ -103,6 +106,13 @@ pub struct Trade {
     pub exit_reason: Option<String>,
     #[serde(default)]
     pub entry_fee: f64,
+    /// Initial stop distance as a price fraction; 0 for trades opened before ATR stops.
+    #[serde(default)]
+    pub stop_dist: f64,
+    /// Open trade: funding already booked into closed slices. Closed trade: its own
+    /// funding (negative is a cost). Futures only.
+    #[serde(default)]
+    pub funding: f64,
 }
 impl Trade {
     pub fn mark(&self, price: f64) -> Value {

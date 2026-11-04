@@ -111,6 +111,10 @@ pub fn validate(c: &Config) -> Result<()> {
         "现货不能加杠杆或做空"
     );
     ensure!(
+        c.risk_per_trade_pct.is_finite() && (0.1..=5.0).contains(&c.risk_per_trade_pct),
+        "每笔风险在 0.1% 到 5% 之间"
+    );
+    ensure!(
         c.capital.is_none_or(|v| v.is_finite() && v > 0.0),
         "资金上限必须是大于 0 的有效金额"
     );
@@ -270,6 +274,9 @@ async fn handle(
                 body["leverage"].as_u64().context("杠杆无效")? as u32
             };
             new.short = new.market == "futures" && body["short"].as_bool().unwrap_or(false);
+            if let Some(r) = body.get("risk_per_trade_pct").filter(|v| !v.is_null()) {
+                new.risk_per_trade_pct = r.as_f64().context("每笔风险无效")?;
+            }
             validate(&new)?;
             ensure!(
                 app.store.unresolved()?.is_empty(),
@@ -480,7 +487,7 @@ pub async fn overview(app: &App) -> Result<Value> {
             json!({"date":day,"abs_profit":daily.get(&day).copied().unwrap_or(0.0)})
         })
         .collect();
-    let mut out = json!({"engine":"rust","server_ip":std::env::var("SERVER_IP").unwrap_or_default(),"key":mask(&c.exchange.key),"telegram":c.telegram.enabled,"capital":c.capital,"market":c.market,"leverage":c.leverage,"short":c.short,"pairs":c.pairs,"max_open":c.max_open,"max_pairs":12,"max_open_limit":5,"max_leverage":25,"price_stop":0.08,"ai":c.ai.enabled,"state":if c.running{"running"}else{"stopped"},"strategy":"AI","timeframe":"4h","open":[],"watch":[],"daily":days,"recent":closed.iter().take(5).collect::<Vec<_>>(),"profit":{"profit_closed_coin":profit,"profit_closed_ratio_mean":if closed.is_empty(){0.0}else{closed.iter().map(|t|t.profit_ratio).sum::<f64>()/closed.len() as f64},"closed_trade_count":closed.len(),"winning_trades":closed.iter().filter(|t|t.profit_abs>0.0).count(),"losing_trades":closed.iter().filter(|t|t.profit_abs<=0.0).count()}});
+    let mut out = json!({"engine":"rust","server_ip":std::env::var("SERVER_IP").unwrap_or_default(),"key":mask(&c.exchange.key),"telegram":c.telegram.enabled,"capital":c.capital,"market":c.market,"leverage":c.leverage,"short":c.short,"pairs":c.pairs,"max_open":c.max_open,"max_pairs":12,"max_open_limit":5,"max_leverage":25,"risk_per_trade_pct":c.risk_per_trade_pct,"stop_rule":"2.5×ATR，2%–10%","ai":c.ai.enabled,"state":if c.running{"running"}else{"stopped"},"strategy":"AI","timeframe":"4h","open":[],"watch":[],"daily":days,"recent":closed.iter().take(5).collect::<Vec<_>>(),"profit":{"profit_closed_coin":profit,"profit_closed_ratio_mean":if closed.is_empty(){0.0}else{closed.iter().map(|t|t.profit_ratio).sum::<f64>()/closed.len() as f64},"closed_trade_count":closed.len(),"winning_trades":closed.iter().filter(|t|t.profit_abs>0.0).count(),"losing_trades":closed.iter().filter(|t|t.profit_abs<=0.0).count()}});
     let result:Result<()> =async {
         let ticks=ex.tickers(&c.market).await?;let mut open=vec![];for t in &held{let p=ticks["list"].as_array().and_then(|a|a.iter().find(|p|p["symbol"]==symbol(&t.pair))).context("持仓行情缺失")?;open.push(t.mark(num(&p["lastPrice"])));}
         out["open"]=json!(open);
