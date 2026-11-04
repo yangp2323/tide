@@ -4,6 +4,25 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 host=${DEPLOY_HOST:-s-tokyo}
 [[ "$host" =~ ^[a-zA-Z0-9_.@-]+$ ]] || { echo 'Invalid DEPLOY_HOST'; exit 1; }
+
+# Only a commit that exists on the remote may be deployed, so the server always runs code
+# that can be recovered from the repository.
+if test -n "$(git status --porcelain)"; then
+  echo '部署中止：有未提交的改动，请先提交。'
+  git status --short
+  exit 1
+fi
+upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null) || {
+  echo '部署中止：当前分支没有对应的远端分支，请先 git push -u。'
+  exit 1
+}
+git fetch --quiet "${upstream%%/*}" || { echo '部署中止：无法连接远端仓库。'; exit 1; }
+if test "$(git rev-parse HEAD)" != "$(git rev-parse '@{u}')"; then
+  echo "部署中止：本地提交与 $upstream 不一致（未推送或落后于远端），请先 push / pull。"
+  git status -sb | head -1
+  exit 1
+fi
+
 mkdir -p dist
 exec 8>dist/deploy.lock
 flock -n 8 || { echo 'Another local deployment is running'; exit 1; }
