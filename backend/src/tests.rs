@@ -642,6 +642,10 @@ async fn sim_exchange(
                 14_400_000
             };
             let end = chrono::Utc::now().timestamp_millis() / step * step - step;
+            if q.get("limit").is_some_and(|l| l == "2") {
+                // The newest row is the candle that is still forming.
+                return axum::Json(json!({"retCode":0,"result":{"list":[[(end + step).to_string(),"10","10.4","9.9","10.2","3"],[end.to_string(),"10","10.05","9.95","10","1"]]}})).into_response();
+            }
             json!({"list":(0..300).map(|i| json!([(end - i * step).to_string(),"10","10.05","9.95","10","1"])).collect::<Vec<_>>()})
         }
         "/v5/position/list" => json!({"list":s.positions.clone()}),
@@ -809,6 +813,9 @@ async fn futures_stops_follow_ai_trail_and_external_take_profit() {
     let snap = app.snapshot().await.unwrap();
     assert_eq!(snap["open_positions"][0]["entry_reason"], "突破后回踩确认");
     assert_eq!(snap["open_positions"][0]["leverage"], 5);
+    assert_eq!(snap["pairs"][0]["market_stats"]["last_price"], 10.0);
+    assert_eq!(snap["pairs"][0]["forming_4h_candle"]["high_so_far"], 10.4);
+    assert_eq!(snap["pairs"][0]["forming_4h_candle"]["last"], 10.2);
     assert_eq!(snap["account"]["available_usdt"], 1000.0);
     // The exchange's own view is sent live: the bot's position is flagged as its own and a
     // position and an order the operator placed by hand are shown as theirs.

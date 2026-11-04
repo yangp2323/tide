@@ -220,12 +220,40 @@ impl Bybit {
             )
             .await?;
         let t = &v["list"][0];
-        let mut out = json!({"change_24h_pct":num(&t["price24hPcnt"])*100.0,"turnover_24h_usdt":num(&t["turnover24h"])});
+        let mut out = json!({"last_price":num(&t["lastPrice"]),"bid":num(&t["bid1Price"]),"ask":num(&t["ask1Price"]),"change_24h_pct":num(&t["price24hPcnt"])*100.0,"turnover_24h_usdt":num(&t["turnover24h"])});
         if market == "futures" {
             out["funding_rate_pct"] = json!(num(&t["fundingRate"]) * 100.0);
             out["open_interest"] = json!(num(&t["openInterest"]));
         }
         Ok(out)
+    }
+    /// The candle that is still forming (open, range so far, volume), which `candles` leaves out
+    /// because its indicators are not final until it closes.
+    pub async fn forming_candle(
+        &self,
+        market: &str,
+        pair: &str,
+        interval: u32,
+    ) -> Result<Option<Value>> {
+        let v = self
+            .get(
+                "/v5/market/kline",
+                json!({"category":category(market),"symbol":symbol(pair),"interval":interval.to_string(),"limit":2}),
+                false,
+            )
+            .await?;
+        let now = chrono::Utc::now().timestamp_millis();
+        Ok(v["list"].as_array().into_iter().flatten().find_map(|r| {
+            let t = num(&r[0]) as i64;
+            if t + interval as i64 * 60000 <= now {
+                return None;
+            }
+            let opened = chrono::DateTime::from_timestamp_millis(t)?;
+            Some(json!({
+                "opened_utc":opened.format("%Y-%m-%d %H:%M").to_string(),
+                "open":num(&r[1]),"high_so_far":num(&r[2]),"low_so_far":num(&r[3]),"last":num(&r[4]),"volume_so_far":num(&r[5]),
+            }))
+        }))
     }
     async fn klines(
         &self,
