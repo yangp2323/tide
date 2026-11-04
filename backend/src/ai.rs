@@ -261,6 +261,7 @@ impl App {
             rec["error"] = json!(e.to_string());
         }
         rec["seconds"] = json!(started.elapsed().as_secs_f64());
+        let failing_before = !self.ai_state.lock().await["last_error"].is_null();
         {
             let mut state = self.ai_state.lock().await;
             state["running"] = json!(false);
@@ -268,11 +269,89 @@ impl App {
             state["last_error"] = rec["error"].clone();
         }
         self.store.decision(&rec)?;
-        if execute {
-            let _ = self.telegram(&c, &format!("AI 决策：{}", rec)).await;
+        // Holding runs stay quiet and a model that keeps failing is reported once, not every run.
+        if let Some(text) = telegram_summary(&rec, execute, failing_before) {
+            let _ = self.telegram(&c, &text).await;
         }
         Ok(rec)
     }
+}
+/// A short Telegram message for a run that did something worth a ping, or None.
+fn telegram_summary(rec: &Value, execute: bool, failing_before: bool) -> Option<String> {
+    let source = match rec["source"].as_str().unwrap_or("") {
+        "auto" => "定时",
+        "manual" => "手动",
+        "hook" => "事件触发",
+        "mcp" => "外部接口",
+        other => other,
+    };
+    if let Some(e) = rec["error"].as_str() {
+        return (execute && !failing_before)
+            .then(|| format!("AI 分析出错（{}）：{}", source, clip(e, 300)));
+    }
+    let acts = rec["actions"].as_array()?;
+    if !execute || acts.is_empty() {
+        return None;
+    }
+    let why: Vec<String> = rec["trigger"]["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|e| {
+            match e["type"].as_str().unwrap_or("") {
+                "adverse_move" => "浮亏逼近止损",
+                "profit_milestone" => "浮盈走出一个止损距离",
+                "position_closed" => "仓位被平",
+                "big_move" => "价格大幅波动",
+                "webhook" => "外部 Webhook",
+                other => other,
+            }
+            .to_string()
+        })
+        .collect();
+    let mut text = format!(
+        "AI 决策（{}{}）",
+        source,
+        if why.is_empty() {
+            String::new()
+        } else {
+            format!("：{}", why.join("、"))
+        }
+    );
+    for a in acts {
+        let status = match a["status"].as_str() {
+            Some("executed") => "✅ 已执行",
+            Some("blocked") => "⛔ 风控拦截",
+            Some("failed") => "❌ 失败",
+            _ => continue,
+        };
+        let act = match a["action"].as_str().unwrap_or("") {
+            "open_long" => "开多",
+            "open_short" => "开空",
+            "close" => "平仓",
+            "set_stops" => "调整止损止盈",
+            other => other,
+        };
+        let pair = a["pair"]
+            .as_str()
+            .unwrap_or("")
+            .split('/')
+            .next()
+            .unwrap_or("");
+        let note = a["note"]
+            .as_str()
+            .filter(|n| !n.is_empty())
+            .map_or(String::new(), |n| format!("（{}）", clip(n, 100)));
+        text += &format!(
+            "\n{} {} {}：{}{}",
+            status,
+            act,
+            pair,
+            clip(a["reason"].as_str().unwrap_or(""), 160),
+            note
+        );
+    }
+    Some(clip(&text, 3000).to_string())
 }
 /// The model sometimes wraps its JSON in prose or a code fence; take the outermost object.
 pub fn extract_json(text: &str) -> &str {
@@ -1041,6 +1120,26 @@ mod model_tests {
         assert!(body.get("thinking").is_none());
         assert!(body.get("output_config").is_none());
         assert_eq!(old.claude_thinking_budget, 4096);
+    }
+
+    #[test]
+    fn telegram_hears_about_actions_and_new_failures_but_not_about_holding() {
+        let hold = json!({"source":"auto","actions":[]});
+        assert!(telegram_summary(&hold, true, false).is_none());
+        let acted = json!({"source":"hook","trigger":{"events":[{"type":"adverse_move"}]},"actions":[
+            {"action":"open_long","pair":"BTC/USDT:USDT","reason":"突破","status":"executed"},
+            {"action":"open_short","pair":"ETH/USDT:USDT","reason":"反向","status":"blocked","note":"同向敞口"}]});
+        let text = telegram_summary(&acted, true, false).unwrap();
+        assert!(
+            text.contains("事件触发：浮亏逼近止损") && text.contains("✅ 已执行 开多 BTC：突破")
+        );
+        assert!(text.contains("⛔ 风控拦截 开空 ETH：反向（同向敞口）") && text.len() < 600);
+        assert!(telegram_summary(&acted, false, false).is_none());
+        let failed = json!({"source":"auto","error":"模型超时","actions":[]});
+        assert!(telegram_summary(&failed, true, false)
+            .unwrap()
+            .contains("模型超时"));
+        assert!(telegram_summary(&failed, true, true).is_none());
     }
 
     #[test]
