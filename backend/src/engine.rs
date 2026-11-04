@@ -448,7 +448,15 @@ impl App {
         let ai = tag != "trend";
         entry_guard(&c, &held, pnl, equity, pair, short, confidence, ai)?;
         let peak = self.track_equity(equity)?;
-        let since = self.store.state("breaker_since")?.unwrap_or_default();
+        // Losses from before the breaker existed must not block the first entry after an upgrade.
+        let since = match self.store.state("breaker_since")?.filter(|s| !s.is_empty()) {
+            Some(s) => s,
+            None => {
+                let started = now();
+                self.store.set_state("breaker_since", &started)?;
+                started
+            }
+        };
         breaker(
             &c,
             &self
@@ -776,7 +784,7 @@ impl App {
             .context("缺少下单精度")?;
         let trigger = quantize(t.stop_loss_abs, tick_size)?;
         if let Some(link) = self.store.state(&key)?.filter(|l| !l.is_empty()) {
-            match ex.lookup(&t.market, &t.pair, &link).await? {
+            match ex.lookup_stop(&t.market, &t.pair, &link).await? {
                 Some(o) if matches!(o["orderStatus"].as_str(), Some("Untriggered" | "New")) => {
                     if (num(&o["triggerPrice"]) - trigger.parse::<f64>()?).abs()
                         > tick_size.parse::<f64>()? * 0.5
@@ -785,19 +793,35 @@ impl App {
                     }
                     return Ok(SpotStop::Hosted);
                 }
-                Some(_) => match ex.confirm(&t.market, &t.pair, &link).await? {
+                Some(_) => match ex.confirm_stop(&t.market, &t.pair, &link).await? {
                     // Triggered but not final yet: keep waiting, do not sell a second time.
                     None => return Ok(SpotStop::Hosted),
                     Some(fill) if fill.qty > 0.0 => {
                         self.store.set_state(&key, "")?;
                         let order = json!({"link":link,"action":"exit","data":{"trade":t,"reason":"stop_loss_on_exchange","request":{"qty":fill.qty},"qty_step":step}});
                         self.settle(&order, fill).await?;
+                        let _ = self
+                            .telegram(&self.store.config()?, &format!("止损单成交 {}", t.pair))
+                            .await;
                         return Ok(SpotStop::Settled);
                     }
                     Some(_) => self.store.set_state(&key, "")?,
                 },
                 None => self.store.set_state(&key, "")?,
             }
+        }
+        // Never stack a second stop: adopt one that is already resting (for example after the
+        // saved link was lost) instead of creating another.
+        if let Some(link) = ex
+            .resting_stops(&t.pair)
+            .await?
+            .iter()
+            .filter(|o| o["side"] == "Sell")
+            .filter(|o| matches!(o["orderStatus"].as_str(), Some("Untriggered" | "New")))
+            .find_map(|o| o["orderLinkId"].as_str().filter(|l| !l.is_empty()))
+        {
+            self.store.set_state(&key, link)?;
+            return Ok(SpotStop::Hosted);
         }
         let link = format!("s{}", uuid::Uuid::new_v4().simple());
         let body = json!({"category":"spot","symbol":symbol(&t.pair),"side":"Sell","orderType":"Market","qty":quantize(t.amount,step)?,"marketUnit":"baseCoin","triggerPrice":trigger,"orderFilter":"StopOrder","orderLinkId":link});
@@ -820,7 +844,7 @@ impl App {
         let Some(link) = self.store.state(&key)?.filter(|l| !l.is_empty()) else {
             return Ok(());
         };
-        match ex.lookup(&t.market, &t.pair, &link).await? {
+        match ex.lookup_stop(&t.market, &t.pair, &link).await? {
             None => {}
             Some(o) => match o["orderStatus"].as_str().unwrap_or("") {
                 "Untriggered" | "New" => {

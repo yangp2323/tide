@@ -322,7 +322,36 @@ impl Bybit {
         Ok(out)
     }
     pub async fn lookup(&self, market: &str, pair: &str, link: &str) -> Result<Option<Value>> {
-        let args = json!({"category":category(market),"symbol":symbol(pair),"orderLinkId":link});
+        self.lookup_filtered(market, pair, link, None).await
+    }
+    /// Conditional orders are only returned when `orderFilter=StopOrder` is asked for.
+    pub async fn lookup_stop(&self, market: &str, pair: &str, link: &str) -> Result<Option<Value>> {
+        self.lookup_filtered(market, pair, link, Some("StopOrder"))
+            .await
+    }
+    /// Conditional orders still waiting on Bybit for this spot symbol.
+    pub async fn resting_stops(&self, pair: &str) -> Result<Vec<Value>> {
+        let v = self
+            .get(
+                "/v5/order/realtime",
+                json!({"category":"spot","symbol":symbol(pair),"orderFilter":"StopOrder","limit":50}),
+                true,
+            )
+            .await?;
+        Ok(v["list"].as_array().cloned().unwrap_or_default())
+    }
+    async fn lookup_filtered(
+        &self,
+        market: &str,
+        pair: &str,
+        link: &str,
+        filter: Option<&str>,
+    ) -> Result<Option<Value>> {
+        let mut args =
+            json!({"category":category(market),"symbol":symbol(pair),"orderLinkId":link});
+        if let Some(f) = filter {
+            args["orderFilter"] = json!(f);
+        }
         for path in ["/v5/order/realtime", "/v5/order/history"] {
             let v = self.get(path, args.clone(), true).await?;
             if let Some(row) = v["list"].as_array().and_then(|a| a.first()) {
@@ -417,7 +446,20 @@ impl Bybit {
         Ok(total)
     }
     pub async fn confirm(&self, market: &str, pair: &str, link: &str) -> Result<Option<Fill>> {
-        let Some(o) = self.lookup(market, pair, link).await? else {
+        self.confirm_with(market, pair, link, None).await
+    }
+    pub async fn confirm_stop(&self, market: &str, pair: &str, link: &str) -> Result<Option<Fill>> {
+        self.confirm_with(market, pair, link, Some("StopOrder"))
+            .await
+    }
+    async fn confirm_with(
+        &self,
+        market: &str,
+        pair: &str,
+        link: &str,
+        filter: Option<&str>,
+    ) -> Result<Option<Fill>> {
+        let Some(o) = self.lookup_filtered(market, pair, link, filter).await? else {
             return Ok(None);
         };
         let terminal = matches!(

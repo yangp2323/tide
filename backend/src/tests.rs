@@ -471,9 +471,13 @@ async fn sim_exchange(
             o["orderStatus"] = json!("Cancelled");
             json!({})
         }
-        "/v5/order/realtime" | "/v5/order/history" => {
-            json!({"list":q.get("orderLinkId").and_then(|id|s.orders.get(id)).cloned().into_iter().collect::<Vec<_>>()})
-        }
+        "/v5/order/realtime" | "/v5/order/history" => match q.get("orderLinkId") {
+            Some(id) => json!({"list":s.orders.get(id).cloned().into_iter().collect::<Vec<_>>()}),
+            None if q.get("orderFilter").is_some_and(|f| f == "StopOrder") => {
+                json!({"list":s.orders.iter().filter(|(_, o)| o["orderStatus"] == "Untriggered").map(|(k, o)| { let mut o = o.clone(); o["orderLinkId"] = json!(k); o }).collect::<Vec<_>>()})
+            }
+            None => json!({"list":[]}),
+        },
         "/v5/execution/list" => match q.get("orderId") {
             Some(id) => {
                 let o = s
@@ -673,6 +677,20 @@ async fn spot_stop_rests_on_the_exchange_and_is_cancelled_before_a_sale() {
         assert_eq!(stop_order(&s).1["triggerPrice"], "9.80");
         assert_eq!(s.orders.keys().filter(|k| k.starts_with('s')).count(), 1);
     }
+    // If the saved link is lost, the resting order is adopted rather than duplicated.
+    app.store
+        .set_state(&format!("spot_stop:{}", t.trade_id), "")
+        .unwrap();
+    tick().await;
+    assert_eq!(
+        sim.lock()
+            .await
+            .orders
+            .keys()
+            .filter(|k| k.starts_with('s'))
+            .count(),
+        1
+    );
     // The exchange fires the stop: the trade is settled without a second sale.
     {
         let mut s = sim.lock().await;
