@@ -3,7 +3,7 @@ use crate::{
     engine::usdt,
     exchange::{category, symbol},
     indicators,
-    model::{mask, num, AiConfig, Config, Credentials},
+    model::{mask, num, AiConfig, Channel, Config, Credentials},
     App,
 };
 use anyhow::{bail, ensure, Context, Result};
@@ -124,7 +124,28 @@ pub fn validate(c: &Config) -> Result<()> {
 fn ai_public(c: &AiConfig) -> Value {
     let mut v = json!(c);
     v["api_key"] = json!(mask(&c.api_key));
+    for (i, ch) in c.channels.iter().enumerate() {
+        v["channels"][i]["api_key"] = json!(mask(&ch.api_key));
+    }
     v
+}
+/// Checks that apply to one channel together with the shared AI settings.
+fn validate_channel(a: &AiConfig, ch: &Channel) -> Result<()> {
+    ensure!(
+        !ch.name.trim().is_empty() && ch.name.chars().count() <= 40,
+        "渠道名称须为 1 到 40 个字符"
+    );
+    let probe = a.with_channel(ch);
+    ensure!(
+        matches!(probe.provider.as_str(), "anthropic" | "openai") && !probe.model.trim().is_empty(),
+        "模型配置无效"
+    );
+    crate::ai::validate_model_options(&probe)?;
+    if !probe.base_url.is_empty() {
+        let url = url::Url::parse(&probe.base_url)?;
+        ensure!(url.scheme() == "https", "模型接口必须使用 HTTPS");
+    }
+    Ok(())
 }
 async fn handle(
     app: &Arc<App>,
@@ -324,24 +345,54 @@ async fn handle(
             c = new;
         }
         ("POST", "/api/ai/config") => {
-            let mut value = json!(c.ai);
+            // Model fields belong to a channel (the active one unless `channel` names another);
+            // everything else is shared by all channels.
+            const CHANNEL_KEYS: [&str; 12] = [
+                "name",
+                "provider",
+                "api_protocol",
+                "reasoning_effort",
+                "claude_thinking",
+                "claude_effort",
+                "claude_thinking_budget",
+                "stream",
+                "model",
+                "api_key",
+                "base_url",
+                "id",
+            ];
             let obj = body.as_object().context("AI 配置无效")?;
+            let target = obj
+                .get("channel")
+                .and_then(Value::as_str)
+                .unwrap_or(&c.ai.active_channel)
+                .to_string();
+            let idx =
+                c.ai.channels
+                    .iter()
+                    .position(|ch| ch.id == target)
+                    .context("渠道不存在")?;
+            let mut value = json!(c.ai);
             for (k, v) in obj {
-                if k == "enabled" {
+                if matches!(
+                    k.as_str(),
+                    "enabled" | "channel" | "channels" | "active_channel" | "id"
+                ) {
                     continue;
                 }
                 if k == "api_key" && (v.is_null() || v == "") {
                     continue;
                 }
-                value[k] = v.clone();
+                if CHANNEL_KEYS.contains(&k.as_str()) {
+                    value["channels"][idx][k] = v.clone();
+                } else {
+                    value[k] = v.clone();
+                }
             }
-            let a: AiConfig = serde_json::from_value(value)?;
-            ensure!(
-                matches!(a.provider.as_str(), "anthropic" | "openai") && !a.model.trim().is_empty(),
-                "模型配置无效"
-            );
+            let mut a: AiConfig = serde_json::from_value(value)?;
+            validate_channel(&a, &a.channels[idx])?;
+            a.normalize();
             crate::ai::validate_schedule(a.interval, a.delay_seconds)?;
-            crate::ai::validate_model_options(&a)?;
             ensure!(
                 (0.0..=1.0).contains(&a.min_confidence)
                     && (0.5..=50.0).contains(&a.max_daily_loss_pct)
@@ -349,11 +400,58 @@ async fn handle(
                     && a.max_consecutive_losses <= 50,
                 "AI 风控参数超出范围"
             );
-            if !a.base_url.is_empty() {
-                let url = url::Url::parse(&a.base_url)?;
-                ensure!(url.scheme() == "https", "模型接口必须使用 HTTPS");
-            }
             c.ai = a;
+            app.store.save_config(&c)?;
+            return Ok(ai_public(&c.ai));
+        }
+        ("POST", "/api/ai/channels") => {
+            ensure!(c.ai.channels.len() < 8, "最多保存 8 个渠道");
+            let provider = body["provider"].as_str().unwrap_or("anthropic");
+            ensure!(matches!(provider, "anthropic" | "openai"), "模型服务商无效");
+            let mut ch = Channel {
+                id: format!("c{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
+                name: body["name"].as_str().unwrap_or("").trim().into(),
+                provider: provider.into(),
+                ..Channel::default()
+            };
+            if provider == "openai" {
+                ch.model = "deepseek-chat".into();
+            }
+            validate_channel(&c.ai, &ch)?;
+            let id = ch.id.clone();
+            c.ai.channels.push(ch);
+            app.store.save_config(&c)?;
+            let mut out = ai_public(&c.ai);
+            out["created"] = json!(id);
+            return Ok(out);
+        }
+        ("POST", "/api/ai/channels/select") => {
+            let id = body["id"].as_str().context("缺少渠道")?;
+            let ch =
+                c.ai.channels
+                    .iter()
+                    .find(|ch| ch.id == id)
+                    .context("渠道不存在")?;
+            ensure!(!ch.api_key.is_empty(), "这个渠道还没有保存 API Key");
+            // Never swap the model underneath an analysis that is already running.
+            let _idle = app
+                .ai_gate
+                .try_lock()
+                .map_err(|_| anyhow::anyhow!("正在分析，等这一轮结束后再切换渠道"))?;
+            c.ai.active_channel = id.into();
+            app.store.save_config(&c)?;
+            return Ok(ai_public(&app.store.config()?.ai));
+        }
+        ("DELETE", p) if p.starts_with("/api/ai/channels/") => {
+            let id = p.trim_start_matches("/api/ai/channels/");
+            ensure!(c.ai.channels.len() > 1, "至少保留一个渠道");
+            ensure!(
+                id != c.ai.active_channel,
+                "不能删除正在使用的渠道，请先切换到其他渠道"
+            );
+            let before = c.ai.channels.len();
+            c.ai.channels.retain(|ch| ch.id != id);
+            ensure!(c.ai.channels.len() < before, "渠道不存在");
             app.store.save_config(&c)?;
             return Ok(ai_public(&c.ai));
         }

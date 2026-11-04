@@ -366,6 +366,87 @@ async fn execution_is_durable_and_closing_releases_position_slots() {
         assert_eq!(app.store.config().unwrap().ai.claude_thinking, "adaptive");
         assert_eq!(app.store.config().unwrap().ai.claude_effort, "high");
     }
+    // Several API channels can be saved; one is in use and the rest are kept.
+    let send = |path: &str, method: &str, body: Value| {
+        let rb = if method == "DELETE" {
+            http.delete(format!("{}{}", url, path))
+        } else {
+            http.post(format!("{}{}", url, path))
+        };
+        rb.header("cookie", &cookie)
+            .header("origin", &app.origin)
+            .json(&body)
+            .send()
+    };
+    let r = send(
+        "/ai/channels",
+        "POST",
+        json!({"name":"备用","provider":"openai"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.status(), 200);
+    let config: Value = r.json().await.unwrap();
+    let spare = config["created"].as_str().unwrap().to_string();
+    assert_eq!(config["channels"].as_array().unwrap().len(), 2);
+    assert_eq!(config["active_channel"], "default");
+    assert_eq!(config["channels"][1]["model"], "deepseek-chat");
+    assert!(config["channels"][1]["api_key"].is_null());
+    // A channel without a key cannot be put in use.
+    let r = send("/ai/channels/select", "POST", json!({"id":spare}))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let r = send(
+        "/ai/config",
+        "POST",
+        json!({"channel":spare,"api_key":"sk-test-key-12345","base_url":"https://relay.example.com","model":"gpt-x"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.status(), 200);
+    let config: Value = r.json().await.unwrap();
+    // Editing another channel leaves the one in use alone, and keys are never returned in full.
+    assert_eq!(config["active_channel"], "default");
+    assert_eq!(config["api_protocol"], "responses");
+    assert_eq!(config["channels"][1]["model"], "gpt-x");
+    assert_eq!(config["channels"][1]["api_key"], "sk-t…2345");
+    let r = send("/ai/channels/select", "POST", json!({"id":spare}))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let config: Value = r.json().await.unwrap();
+    assert_eq!(config["active_channel"], spare);
+    assert_eq!(config["model"], "gpt-x");
+    assert_eq!(config["provider"], "openai");
+    assert_eq!(config["interval"], 7);
+    assert_eq!(
+        app.store.config().unwrap().ai.base_url,
+        "https://relay.example.com"
+    );
+    // The channel in use cannot be deleted; the last remaining one cannot either.
+    assert_eq!(
+        send(&format!("/ai/channels/{}", spare), "DELETE", json!({}))
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    assert_eq!(
+        send("/ai/channels/default", "DELETE", json!({}))
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(app.store.config().unwrap().ai.channels.len(), 1);
+    assert_eq!(
+        send(&format!("/ai/channels/{}", spare), "DELETE", json!({}))
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
     api_server.abort();
     server.abort();
     std::env::remove_var("BYBIT_BASE_URL");
@@ -751,4 +832,28 @@ fn schema_is_versioned_and_open_trades_are_filtered_in_sql() {
     assert!(store.open_trades().unwrap().is_empty());
     assert_eq!(store.realized_on("2000-01-01").unwrap(), 0.0);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn legacy_ai_config_becomes_one_channel() {
+    let mut a: model::AiConfig = serde_json::from_value(
+        json!({"provider":"openai","model":"m","api_key":"k","base_url":"https://x.example"}),
+    )
+    .unwrap();
+    assert!(a.channels.is_empty());
+    a.normalize();
+    assert_eq!(a.channels.len(), 1);
+    assert_eq!(a.active_channel, "default");
+    let ch = a.active().unwrap();
+    assert_eq!(
+        (ch.provider.as_str(), ch.model.as_str(), ch.api_key.as_str()),
+        ("openai", "m", "k")
+    );
+    // Normalizing again changes nothing, and a stale active id falls back to the first channel.
+    let before = serde_json::to_string(&a).unwrap();
+    a.normalize();
+    assert_eq!(before, serde_json::to_string(&a).unwrap());
+    a.active_channel = "gone".into();
+    a.normalize();
+    assert_eq!(a.active_channel, "default");
 }

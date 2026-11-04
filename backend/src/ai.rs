@@ -203,7 +203,7 @@ impl App {
         ensure!(!execute || c.ai.enabled, "先开启 AI 交易");
         self.ai_state.lock().await["running"] = json!(true);
         let started = std::time::Instant::now();
-        let mut rec = json!({"time":now(),"source":source,"model":c.ai.model,"execute":execute});
+        let mut rec = json!({"time":now(),"source":source,"model":c.ai.model,"channel":c.ai.active().map(|ch| ch.name.clone()),"execute":execute});
         let result: Result<()> = async {
             let snap = self.snapshot().await?;
             let (text, usage) = call_model(&c, &snap).await?;

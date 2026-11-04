@@ -29,14 +29,18 @@ impl Store {
     }
     pub fn config(&self) -> Result<Config> {
         let path = self.dir.join("config.json");
-        if path.exists() {
-            Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+        let mut c: Config = if path.exists() {
+            serde_json::from_slice(&std::fs::read(path)?)?
         } else {
-            Ok(Config::default())
-        }
+            Config::default()
+        };
+        c.ai.normalize();
+        Ok(c)
     }
     pub fn save_config(&self, c: &Config) -> Result<()> {
-        atomic_json(&self.dir.join("config.json"), c)
+        let mut c = c.clone();
+        c.ai.normalize();
+        atomic_json(&self.dir.join("config.json"), &c)
     }
     pub fn trades(&self) -> Result<Vec<Trade>> {
         let db = self.db.lock().unwrap();

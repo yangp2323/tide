@@ -1,11 +1,28 @@
 "use client";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useFeedback } from "@/components/Feedback";
-import { api, post } from "@/lib/api";
+import { api, del, post } from "@/lib/api";
 import { AI_ACT, AI_SOURCE, AI_STATUS, base, utc } from "@/lib/fmt";
 import { Card, Empty, MsgBox, Skeleton, StateLabel, useAction } from "@/lib/ui";
 
+type Channel = {
+  id: string;
+  name: string;
+  provider: string;
+  api_protocol: string;
+  reasoning_effort: string;
+  claude_thinking: string;
+  claude_effort: string;
+  claude_thinking_budget: number;
+  stream: boolean;
+  model: string;
+  base_url: string;
+  api_key: string | null;
+};
+
 type Cfg = {
+  channels: Channel[];
+  active_channel: string;
   provider: string;
   api_protocol: string;
   reasoning_effort: string;
@@ -46,7 +63,7 @@ function DecisionRow({ r }: { r: any }) {
           {AI_SOURCE[r.source] || r.source}
           {r.execute ? "" : " · 只看建议"}
         </span>
-        <span>{r.model}</span>
+        <span>{r.channel ? `${r.channel} · ` : ""}{r.model}</span>
         {r.seconds ? <span>{r.seconds}s</span> : null}
       </div>
       {r.error ? <div className="msg err">{r.error}</div> : null}
@@ -75,6 +92,10 @@ export default function AiPage() {
   const { busy, msg, setMsg, run } = useAction();
   const [data, setData] = useState<AiData | null>(null);
   const [err, setErr] = useState("");
+  const [editId, setEditId] = useState("");
+  const editRef = useRef("");
+  const [chName, setChName] = useState("");
+  const [newName, setNewName] = useState("");
   const [provider, setProvider] = useState("anthropic");
   const [protocol, setProtocol] = useState("chat_completions");
   const [effort, setEffort] = useState("default");
@@ -93,16 +114,24 @@ export default function AiPage() {
   const [streak, setStreak] = useState(5);
   const [shadow, setShadow] = useState(false);
 
-  const fill = useCallback((c: Cfg) => {
-    setProvider(c.provider);
-    setProtocol(c.api_protocol || "chat_completions");
-    setEffort(c.reasoning_effort || "default");
-    setClaudeThinking(c.claude_thinking || "default");
-    setClaudeEffort(c.claude_effort || "default");
-    setClaudeBudget(c.claude_thinking_budget ?? 4096);
-    setStream(!!c.stream);
-    setModel(c.model);
-    setBaseUrl(c.base_url || "");
+  const selectEdit = useCallback((id: string) => {
+    editRef.current = id;
+    setEditId(id);
+  }, []);
+
+  // The model fields are those of the channel being edited; the rest is shared by all channels.
+  const fill = useCallback((c: Cfg, id?: string) => {
+    const ch: Channel | Cfg = c.channels?.find((x) => x.id === id) ?? c.channels?.find((x) => x.id === c.active_channel) ?? c;
+    setChName((ch as Channel).name || "");
+    setProvider(ch.provider);
+    setProtocol(ch.api_protocol || "chat_completions");
+    setEffort(ch.reasoning_effort || "default");
+    setClaudeThinking(ch.claude_thinking || "default");
+    setClaudeEffort(ch.claude_effort || "default");
+    setClaudeBudget(ch.claude_thinking_budget ?? 4096);
+    setStream(!!ch.stream);
+    setModel(ch.model);
+    setBaseUrl(ch.base_url || "");
     setFreq(c.interval);
     setDelay(c.delay_seconds ?? 180);
     setConf(c.min_confidence);
@@ -112,16 +141,19 @@ export default function AiPage() {
     setShadow(!!c.shadow);
   }, []);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (prefer?: string) => {
     try {
       const r = await api<AiData>("/api/ai");
       setData(r);
-      fill(r.config);
+      const want = prefer || editRef.current;
+      const id = r.config.channels?.some((x) => x.id === want) ? want : r.config.active_channel;
+      selectEdit(id);
+      fill(r.config, id);
       setErr("");
     } catch (e: any) {
       setErr(e?.message || "加载失败");
     }
-  }, [fill]);
+  }, [fill, selectEdit]);
 
   useEffect(() => {
     load();
@@ -140,6 +172,8 @@ export default function AiPage() {
   }, []);
 
   const c = data?.config;
+  const edit = c?.channels?.find((x) => x.id === editId);
+  const isActive = !!c && editId === c.active_channel;
   const on = !!c?.enabled;
   const st = data?.state;
 
@@ -150,6 +184,50 @@ export default function AiPage() {
     setBaseUrl("");
   }
 
+  function pickChannel(id: string) {
+    if (!c) return;
+    selectEdit(id);
+    fill(c, id);
+    setApiKey("");
+  }
+
+  async function addChannel() {
+    await run("channel", async () => {
+      const r = await post<any>("/api/ai/channels", { name: newName, provider });
+      setNewName("");
+      await load(r.created);
+      return { kind: "good", text: "已新增渠道，填好接口地址和 API Key 并保存后，再选择“设为使用”。" };
+    });
+  }
+
+  async function useChannel() {
+    if (!c || !edit) return;
+    if (on) {
+      const ok = await confirm({
+        title: `改用「${edit.name}」？`,
+        body: "下一轮分析起使用这个渠道的模型和 Key。正在进行的分析不会被打断。",
+        ok: "改用",
+      });
+      if (!ok) return;
+    }
+    await run("channel", async () => {
+      await post("/api/ai/channels/select", { id: editId });
+      await load(editId);
+      return { kind: "good", text: `已改用「${edit.name}」。` };
+    });
+  }
+
+  async function removeChannel() {
+    if (!c || !edit) return;
+    const ok = await confirm({ title: `删除渠道「${edit.name}」？`, body: "渠道里保存的 API Key 会一并删除。", ok: "删除", danger: true });
+    if (!ok) return;
+    await run("channel", async () => {
+      await del(`/api/ai/channels/${editId}`);
+      await load(c.active_channel);
+      return { kind: "good", text: "已删除渠道。" };
+    });
+  }
+
   async function saveCfg() {
     await run("save", async () => {
       if (!Number.isInteger(freq) || freq < 1 || freq > 1440) throw new Error("分析间隔须为 1 到 1440 分钟");
@@ -157,6 +235,8 @@ export default function AiPage() {
       if (provider === "anthropic" && claudeThinking === "enabled" && (!Number.isInteger(claudeBudget) || claudeBudget < 1024 || claudeBudget >= 16000)) throw new Error("Claude 手动思考预算须为 1024–15999 tokens");
       if (provider === "anthropic" && claudeThinking === "disabled" && ["xhigh", "max"].includes(claudeEffort)) throw new Error("xhigh/max 等级下不能关闭思考，请选择自适应模式或降低等级");
       await post("/api/ai/config", {
+        channel: editId,
+        name: chName,
         provider,
         api_protocol: protocol,
         reasoning_effort: effort,
@@ -262,12 +342,45 @@ export default function AiPage() {
         <Card
           title="大模型与风控"
           className="ai-settings"
-          right={<StateLabel on={!!c?.api_key}>{c?.api_key ? `已保存 ${c.api_key}` : "未设置"}</StateLabel>}
+          right={<StateLabel on={!!edit?.api_key}>{edit?.api_key ? `已保存 ${edit.api_key}` : "未设置"}</StateLabel>}
         >
           {!c ? (
             <Skeleton lines={6} />
           ) : (
             <>
+              <div className="ai-channels">
+                <label className="f" htmlFor="aiChannel">API 渠道</label>
+                <div className="ai-channel-row">
+                  <select id="aiChannel" value={editId} onChange={(e) => pickChannel(e.target.value)}>
+                    {c.channels.map((ch) => (
+                      <option key={ch.id} value={ch.id}>
+                        {ch.name}
+                        {ch.id === c.active_channel ? "（使用中）" : ""}
+                        {ch.api_key ? "" : "（未设置 Key）"}
+                      </option>
+                    ))}
+                  </select>
+                  {!isActive && (
+                    <button className="ghost" onClick={useChannel} disabled={busy === "channel" || !edit?.api_key}>
+                      设为使用
+                    </button>
+                  )}
+                  {!isActive && (
+                    <button className="ghost" onClick={removeChannel} disabled={busy === "channel"}>
+                      删除
+                    </button>
+                  )}
+                </div>
+                <div className="ai-channel-row">
+                  <input value={newName} maxLength={40} placeholder="新渠道名称，例如：备用中转站" onChange={(e) => setNewName(e.target.value)} />
+                  <button className="ghost" onClick={addChannel} disabled={busy === "channel" || !newName.trim()}>
+                    新增渠道
+                  </button>
+                </div>
+                <p className="hint">下面的接口、模型和 Key 属于当前选中的渠道；间隔、风控等设置所有渠道共用。分析只用“使用中”的渠道，不会自动切换。</p>
+                <label className="f" htmlFor="aiChannelName">渠道名称</label>
+                <input id="aiChannelName" value={chName} maxLength={40} onChange={(e) => setChName(e.target.value)} />
+              </div>
               <div className="seg ai-provider" role="radiogroup" aria-label="接口">
                 <button role="radio" aria-checked={provider === "anthropic"} className={provider === "anthropic" ? "on" : ""} onClick={() => switchProvider("anthropic")}>
                   Claude
@@ -429,7 +542,7 @@ export default function AiPage() {
         title="决策记录"
         note="最近 20 次，最新在最上面"
         right={
-          <button className="ghost sm" onClick={load} disabled={busy === "load"}>
+          <button className="ghost sm" onClick={() => load()} disabled={busy === "load"}>
             刷新
           </button>
         }

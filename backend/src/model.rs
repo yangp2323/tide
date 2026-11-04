@@ -77,6 +77,96 @@ pub struct AiConfig {
     pub max_consecutive_losses: u32,
     /// Analyse and record decisions on schedule without placing any order.
     pub shadow: bool,
+    /// Saved API channels. The model fields above always mirror the active one, so code that
+    /// reads them (and an older build reading the same file) sees the channel in use.
+    pub channels: Vec<Channel>,
+    pub active_channel: String,
+}
+/// One way of reaching a model: provider, endpoint, key and model options.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Channel {
+    pub id: String,
+    pub name: String,
+    pub provider: String,
+    pub api_protocol: String,
+    pub reasoning_effort: String,
+    pub claude_thinking: String,
+    pub claude_effort: String,
+    pub claude_thinking_budget: u32,
+    pub stream: bool,
+    pub model: String,
+    pub api_key: String,
+    pub base_url: String,
+}
+impl Default for Channel {
+    fn default() -> Self {
+        let a = AiConfig::default();
+        Self {
+            id: String::new(),
+            name: String::new(),
+            provider: a.provider,
+            api_protocol: a.api_protocol,
+            reasoning_effort: a.reasoning_effort,
+            claude_thinking: a.claude_thinking,
+            claude_effort: a.claude_effort,
+            claude_thinking_budget: a.claude_thinking_budget,
+            stream: a.stream,
+            model: a.model,
+            api_key: String::new(),
+            base_url: String::new(),
+        }
+    }
+}
+impl AiConfig {
+    fn current_channel(&self, id: &str, name: &str) -> Channel {
+        Channel {
+            id: id.into(),
+            name: name.into(),
+            provider: self.provider.clone(),
+            api_protocol: self.api_protocol.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
+            claude_thinking: self.claude_thinking.clone(),
+            claude_effort: self.claude_effort.clone(),
+            claude_thinking_budget: self.claude_thinking_budget,
+            stream: self.stream,
+            model: self.model.clone(),
+            api_key: self.api_key.clone(),
+            base_url: self.base_url.clone(),
+        }
+    }
+    /// The same settings with a different channel's model fields, for validating a channel.
+    pub fn with_channel(&self, ch: &Channel) -> AiConfig {
+        let mut a = self.clone();
+        a.provider = ch.provider.clone();
+        a.api_protocol = ch.api_protocol.clone();
+        a.reasoning_effort = ch.reasoning_effort.clone();
+        a.claude_thinking = ch.claude_thinking.clone();
+        a.claude_effort = ch.claude_effort.clone();
+        a.claude_thinking_budget = ch.claude_thinking_budget;
+        a.stream = ch.stream;
+        a.model = ch.model.clone();
+        a.api_key = ch.api_key.clone();
+        a.base_url = ch.base_url.clone();
+        a
+    }
+    pub fn active(&self) -> Option<&Channel> {
+        self.channels.iter().find(|c| c.id == self.active_channel)
+    }
+    /// A config written before channels existed becomes one channel; then the flat model
+    /// fields are set from whichever channel is active.
+    pub fn normalize(&mut self) {
+        if self.channels.is_empty() {
+            let ch = self.current_channel("default", "默认");
+            self.channels.push(ch);
+        }
+        if self.active().is_none() {
+            self.active_channel = self.channels[0].id.clone();
+        }
+        let active = self.active().cloned().unwrap();
+        let mirrored = self.with_channel(&active);
+        *self = mirrored;
+    }
 }
 impl Default for AiConfig {
     fn default() -> Self {
@@ -99,6 +189,8 @@ impl Default for AiConfig {
             max_drawdown_pct: 20.0,
             max_consecutive_losses: 5,
             shadow: false,
+            channels: vec![],
+            active_channel: String::new(),
         }
     }
 }
