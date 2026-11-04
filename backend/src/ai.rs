@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 const SYSTEM: &str = r#"You manage a Bybit crypto account. Your primary objective is to grow account equity through positive expected net profit over repeated trades, accounting for fees, slippage and funding costs where applicable. Actively seek evidence-backed long and short opportunities within the supplied risk limits. Evaluate entries, holding and exits by their expected future return; do not make breaking even on a position the objective. Do not force trades when the evidence does not support positive expected net profit, and do not invent unavailable cost estimates or imply guaranteed returns.
-Use only the supplied closed candles and account snapshot. Return only a JSON object {"analysis":"简体中文分析","actions":[{"action":"open_long|open_short|close|set_stops","pair":"exact pair from snapshot","confidence":0.0,"reason":"简体中文理由"}]}. For open_long/open_short also give stop_loss_pct and take_profit_pct (percent of entry price, e.g. 4.5), risk_pct (percent of equity lost if the stop is hit, e.g. 0.8) and, on futures, leverage (integer). For set_stops on an open position give stop_loss_price and/or take_profit_price as absolute prices (take_profit_price 0 removes the take profit). Explain the opportunity or lack of opportunity using specific supplied trend, momentum, volatility and price signals, including the expected direction and what would invalidate the thesis. For each action, explain how it serves the net profit objective. When actions is empty, explain the missing market evidence or binding constraint. Passing a risk check, such as remaining below the daily loss limit, is eligibility to trade and is not evidence of a profitable opportunity.
-Respect whitelist, concurrent position slots, daily loss and min confidence. Closed positions release slots and can be replaced by new longs or shorts; there is no daily entry count limit. Do not add to existing positions. Shorts only when short_allowed. You own stop-loss and take-profit management: review every open position each run and tighten the stop or move the take profit when the evidence changes. Between runs the system only trails the stop at half the initial stop distance once price has moved one stop distance in favor, and it never loosens a stop you set. Every entry gets a take profit; if you omit take_profit_pct it defaults to twice the stop distance. You also decide which direction to trade (shorts when short_allowed) and how many positions to hold, up to max_open. The coins are correlated, so several positions in one direction behave like one large position; judge that yourself. Entries are paused after a drawdown or a losing streak (see risk_limits). Use recent_trades to learn from earlier results, and daily candles, funding_rate_pct and open_interest as context beyond the 4h chart. stop_loss_pct is clamped to 2%-10% (default_atr_stop_pct in the snapshot is the 2.5 × ATR(14) 4h reference), and a stop can only be moved in the favorable direction, never loosened. Stops must sit on the loss side of the current price and take profits on the profit side. You decide position size and leverage: risk_pct is capped by max_risk_per_trade_pct and defaults to that cap, leverage is capped by max_leverage, the symbol limit and a safety limit that keeps the stop well ahead of liquidation, and defaults to that safety limit. Size by conviction: risk less on marginal setups and more on strong ones, and prefer lower leverage unless the setup justifies it. Position value is equity × risk_pct ÷ stop distance, so a wider stop means a smaller position. Each pair's sizing block lists min_order_usdt and min_risk_pct_at_default_stop; if that exceeds max_risk_per_trade_pct the pair cannot be opened with the current equity, so do not propose it. The exchange hosts the stop (and take profit on futures); spot take profit is watched by the system. The daily loss check counts realized PnL plus open floating losses. Confidence must be finite and between 0 and 1."#;
+Use only the supplied closed candles and account snapshot. Return only a JSON object {"analysis":"简体中文分析","memory":"简体中文笔记，写给你下一轮的自己","actions":[{"action":"open_long|open_short|close|set_stops","pair":"exact pair from snapshot","confidence":0.0,"reason":"简体中文理由"}]}. For open_long/open_short also give stop_loss_pct and take_profit_pct (percent of entry price, e.g. 4.5), risk_pct (percent of equity lost if the stop is hit, e.g. 0.8) and, on futures, leverage (integer). For set_stops on an open position give stop_loss_price and/or take_profit_price as absolute prices (take_profit_price 0 removes the take profit). Explain the opportunity or lack of opportunity using specific supplied trend, momentum, volatility and price signals, including the expected direction and what would invalidate the thesis. For each action, explain how it serves the net profit objective. When actions is empty, explain the missing market evidence or binding constraint. Passing a risk check, such as remaining below the daily loss limit, is eligibility to trade and is not evidence of a profitable opportunity.
+Respect whitelist, concurrent position slots, daily loss and min confidence. Closed positions release slots and can be replaced by new longs or shorts; there is no daily entry count limit. Do not add to existing positions. Shorts only when short_allowed. You own stop-loss and take-profit management: review every open position each run and tighten the stop or move the take profit when the evidence changes. Between runs the system only trails the stop at half the initial stop distance once price has moved one stop distance in favor, and it never loosens a stop you set. Every entry gets a take profit; if you omit take_profit_pct it defaults to twice the stop distance. You also decide which direction to trade (shorts when short_allowed) and how many positions to hold, up to max_open. The coins are correlated, so several positions in one direction behave like one large position; judge that yourself. Entries are paused after a drawdown or a losing streak (see risk_limits). You run every few minutes and keep no conversation, so continuity comes from previous_runs (your last runs: analysis, notes_to_self, actions and how they ended) and from each open position's entry_reason. In memory write notes for your next run: for every open position its thesis, the price or condition that invalidates it and how you intend to manage it; setups you are waiting for with their trigger levels; pairs you skipped and why; and any lesson from recent_trades. Stay consistent with your earlier plan unless there is new evidence: do not close or flip a position without naming what invalidated it, and say explicitly when you change your mind and why. Use recent_trades to learn from earlier results, and daily candles, funding_rate_pct and open_interest as context beyond the 4h chart. stop_loss_pct is clamped to 2%-10% (default_atr_stop_pct in the snapshot is the 2.5 × ATR(14) 4h reference), and a stop can only be moved in the favorable direction, never loosened. Stops must sit on the loss side of the current price and take profits on the profit side. You decide position size and leverage: risk_pct is capped by max_risk_per_trade_pct and defaults to that cap, leverage is capped by max_leverage, the symbol limit and a safety limit that keeps the stop well ahead of liquidation, and defaults to that safety limit. Size by conviction: risk less on marginal setups and more on strong ones, and prefer lower leverage unless the setup justifies it. Position value is equity × risk_pct ÷ stop distance, so a wider stop means a smaller position. Each pair's sizing block lists min_order_usdt and min_risk_pct_at_default_stop; if that exceeds max_risk_per_trade_pct the pair cannot be opened with the current equity, so do not propose it. The exchange hosts the stop (and take profit on futures); spot take profit is watched by the system. The daily loss check counts realized PnL plus open floating losses. Confidence must be finite and between 0 and 1."#;
 
 impl App {
     pub async fn snapshot(&self) -> Result<Value> {
@@ -42,7 +42,7 @@ impl App {
         let mut pairs = vec![];
         for t in &held {
             let price = ex.price(&t.market, &t.pair).await?;
-            positions.push(json!({"pair":t.pair,"side":if t.is_short{"short"}else{"long"},"open_rate":t.open_rate,"current_rate":price,"profit_pct":num(&t.mark(price)["profit_ratio"])*100.0,"stop_loss_rate":t.stop_loss_abs,"take_profit_rate":if t.take_profit_abs>0.0{json!(t.take_profit_abs)}else{Value::Null},"opened_utc":t.open_date,"entry_tag":t.enter_tag}));
+            positions.push(json!({"pair":t.pair,"side":if t.is_short{"short"}else{"long"},"open_rate":t.open_rate,"current_rate":price,"profit_pct":num(&t.mark(price)["profit_ratio"])*100.0,"entry_reason":t.entry_reason,"stop_loss_rate":t.stop_loss_abs,"take_profit_rate":if t.take_profit_abs>0.0{json!(t.take_profit_abs)}else{Value::Null},"opened_utc":t.open_date,"entry_tag":t.enter_tag}));
         }
         for p in &c.pairs {
             let cs = ex.candles(&c.market, p, 240, 300, None).await?;
@@ -138,7 +138,7 @@ impl App {
         Ok(
             json!({"time_utc":now(),"exchange":"bybit","market":c.market,"timeframe":"4h","leverage":c.leverage,"short_allowed":c.market=="futures"&&c.short,"bot_state":if c.running{"running"}else{"stopped"},
             "account":{"equity_usdt":equity,"pnl_today_with_floating_loss_usdt":pnl,"pnl_today_with_floating_loss_pct":if equity-pnl>0.0{pnl/(equity-pnl)*100.0}else{0.0}},
-            "risk_limits":{"max_open":c.max_open,"slots_left":c.max_open.saturating_sub(held.len()),"max_daily_loss_pct":c.ai.max_daily_loss_pct,"min_confidence":c.ai.min_confidence,"max_risk_per_trade_pct":c.risk_per_trade_pct,"max_leverage":c.leverage,"max_drawdown_pct":c.ai.max_drawdown_pct,"max_consecutive_losses":c.ai.max_consecutive_losses,"drawdown_from_peak_pct":drawdown},"recent_trades":recent,"open_positions":positions,"pairs":pairs}),
+            "risk_limits":{"max_open":c.max_open,"slots_left":c.max_open.saturating_sub(held.len()),"max_daily_loss_pct":c.ai.max_daily_loss_pct,"min_confidence":c.ai.min_confidence,"max_risk_per_trade_pct":c.risk_per_trade_pct,"max_leverage":c.leverage,"max_drawdown_pct":c.ai.max_drawdown_pct,"max_consecutive_losses":c.ai.max_consecutive_losses,"drawdown_from_peak_pct":drawdown},"recent_trades":recent,"previous_runs":previous_runs(&self.store.decisions(40)?),"open_positions":positions,"pairs":pairs}),
         )
     }
     pub async fn execute_actions(&self, actions: &[Value], external: bool) -> Result<Vec<Value>> {
@@ -245,6 +245,9 @@ impl App {
                 })
                 .collect();
             rec["analysis"] = response["analysis"].clone();
+            if let Some(m) = response["memory"].as_str() {
+                rec["memory"] = json!(clip(m, 2000));
+            }
             let mut done = if execute {
                 self.execute_actions(&valid, false).await?
             } else {
@@ -305,7 +308,53 @@ fn parse_stops(a: &Value) -> Result<Stops> {
         take_profit_pct: opt_num(a, "take_profit_pct")?,
         risk_pct: opt_num(a, "risk_pct")?,
         leverage,
+        reason: a["reason"].as_str().map(|r| clip(r, 600)),
     })
+}
+fn clip(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+/// The model's last few runs, newest first, for its next run: what it concluded, the notes it
+/// left itself, and what happened to its actions. Preview-only runs and failed runs are skipped.
+fn previous_runs(decisions: &[Value]) -> Vec<Value> {
+    const KEYS: [&str; 12] = [
+        "action",
+        "pair",
+        "confidence",
+        "reason",
+        "status",
+        "note",
+        "stop_loss_pct",
+        "take_profit_pct",
+        "risk_pct",
+        "leverage",
+        "stop_loss_price",
+        "take_profit_price",
+    ];
+    decisions
+        .iter()
+        .filter(|d| d["error"].is_null() && (d["execute"] == true || d["shadow"] == true))
+        .take(3)
+        .map(|d| {
+            let actions: Vec<Value> = d["actions"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|a| {
+                            let mut o = json!({});
+                            for k in KEYS {
+                                if !a[k].is_null() {
+                                    o[k] = a[k].clone();
+                                }
+                            }
+                            o
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            json!({"time_utc":d["time"],"executed":d["execute"],"analysis":d["analysis"].as_str().map(|s| clip(s, 2500)),"notes_to_self":d["memory"].as_str().map(|s| clip(s, 2000)),"actions":actions})
+        })
+        .collect()
 }
 /// An optional numeric field: absent or null is None, anything else must be a number.
 fn opt_num(a: &Value, key: &str) -> Result<Option<f64>> {
@@ -568,7 +617,7 @@ fn model_request(ai: &AiConfig, snap: &Value) -> Result<(String, Value)> {
     // Some Responses gateways check the input independently of system instructions
     // before accepting JSON mode, so the requirement belongs in both places.
     let user = format!(
-        "Return only a valid JSON object with analysis and actions.\nSnapshot:\n{}",
+        "Return only a valid JSON object with analysis, memory and actions.\nSnapshot:\n{}",
         snap
     );
     if ai.provider == "anthropic" {
@@ -1251,6 +1300,39 @@ mod schedule_tests {
 #[cfg(test)]
 mod parse_tests {
     use super::*;
+
+    #[test]
+    fn previous_runs_keep_real_runs_with_their_notes() {
+        let run = |time: &str, execute: bool, error: Option<&str>, memory: &str| {
+            let mut d = json!({"time":time,"execute":execute,"analysis":"分析","memory":memory,"actions":[{"action":"open_long","pair":"BTC/USDT","confidence":0.8,"reason":"理由","status":"executed","secret":"x"}]});
+            if let Some(e) = error {
+                d["error"] = json!(e);
+            }
+            d
+        };
+        // Newest first, as the store returns them.
+        let all = vec![
+            run("t5", false, None, "preview"),
+            run("t4", true, Some("504"), "failed"),
+            run("t3", true, None, "m3"),
+            run("t2", true, None, "m2"),
+            run("t1", true, None, "m1"),
+            run("t0", true, None, "m0"),
+        ];
+        let runs = previous_runs(&all);
+        let times: Vec<_> = runs
+            .iter()
+            .map(|r| r["time_utc"].as_str().unwrap())
+            .collect();
+        assert_eq!(times, ["t3", "t2", "t1"]);
+        assert_eq!(runs[0]["notes_to_self"], "m3");
+        assert_eq!(runs[0]["actions"][0]["reason"], "理由");
+        assert!(runs[0]["actions"][0].get("secret").is_none());
+        let mut shadow = run("s", false, None, "ms");
+        shadow["shadow"] = json!(true);
+        assert_eq!(previous_runs(&[shadow]).len(), 1);
+        assert_eq!(clip("你好世界", 2), "你好");
+    }
 
     #[test]
     fn json_is_found_inside_prose_and_bad_actions_are_separated() {

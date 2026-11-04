@@ -616,7 +616,7 @@ async fn sim_app(
     (app, dir, server)
 }
 fn open_long(pair: &str) -> Value {
-    json!({"action":"open_long","pair":pair,"confidence":0.9,"stop_loss_pct":4.0,"take_profit_pct":8.0})
+    json!({"action":"open_long","pair":pair,"confidence":0.9,"reason":"突破后回踩确认","stop_loss_pct":4.0,"take_profit_pct":8.0})
 }
 
 #[tokio::test]
@@ -656,6 +656,18 @@ async fn futures_stops_follow_ai_trail_and_external_take_profit() {
         assert_eq!(create["takeProfit"], "10.80");
         assert_eq!(s.positions[0]["size"], "25.0");
     }
+    assert_eq!(t.entry_reason, "突破后回踩确认");
+    // The next run is shown its own notes and why each position was opened.
+    app.store
+        .decision(&json!({"time":"2026-01-01 00:00:00","source":"auto","execute":true,"analysis":"上一轮分析","memory":"BTC 多单：跌破 9.6 失效","actions":[]}))
+        .unwrap();
+    let snap = app.snapshot().await.unwrap();
+    assert_eq!(snap["open_positions"][0]["entry_reason"], "突破后回踩确认");
+    assert_eq!(
+        snap["previous_runs"][0]["notes_to_self"],
+        "BTC 多单：跌破 9.6 失效"
+    );
+    assert_eq!(snap["previous_runs"].as_array().unwrap().len(), 1);
     // The AI may tighten its stop but never loosen it.
     app.set_stops(t.trade_id, Some(9.8), None).await.unwrap();
     assert!(app.set_stops(t.trade_id, Some(9.0), None).await.is_err());

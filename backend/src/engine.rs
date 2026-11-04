@@ -100,7 +100,7 @@ pub fn risk_stake(equity: f64, risk_pct: f64, stop: f64, leverage: u32) -> f64 {
     equity * risk_pct / 100.0 / stop / leverage as f64
 }
 /// Stop-loss and take-profit the AI asks for when opening, as percentages of the entry price.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct Stops {
     pub stop_pct: Option<f64>,
     pub take_profit_pct: Option<f64>,
@@ -108,6 +108,8 @@ pub struct Stops {
     pub risk_pct: Option<f64>,
     /// Requested leverage; lowered to the symbol limit and to what keeps the stop ahead of liquidation.
     pub leverage: Option<u32>,
+    /// The AI's reason for opening, kept on the trade.
+    pub reason: Option<String>,
 }
 /// Smallest tradable order value in USDT: the exchange minimum rounded up to a whole quantity step.
 pub fn min_order_notional(ins: &Value, futures: bool, price: f64) -> Option<f64> {
@@ -629,6 +631,7 @@ impl App {
             exit_reason: None,
             entry_fee: 0.0,
             stop_dist: stop,
+            entry_reason: stops.reason.clone().unwrap_or_default(),
             funding: 0.0,
         };
         let mut body = json!({"category":category(&c.market),"symbol":symbol(pair),"side":if short{"Sell"}else{"Buy"},"orderType":"Market","qty":qty,"orderLinkId":link});
@@ -1264,6 +1267,7 @@ mod tests {
             exit_reason: None,
             entry_fee: 0.0,
             stop_dist: 0.05,
+            entry_reason: String::new(),
             funding: 0.0,
         };
         assert!(check_new_stops(&t, 110.0, Some(105.0), Some(120.0)).is_ok());
@@ -1303,6 +1307,7 @@ mod tests {
             exit_reason: None,
             entry_fee: 0.0,
             stop_dist: 0.05,
+            entry_reason: String::new(),
             funding: 0.0,
         }
     }

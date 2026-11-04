@@ -68,6 +68,7 @@ function DecisionRow({ r }: { r: any }) {
       </div>
       {r.error ? <div className="msg err">{r.error}</div> : null}
       {r.analysis ? <p>{r.analysis}</p> : null}
+      {r.memory ? <p className="muted">给下一轮的笔记：{r.memory}</p> : null}
       {acts.length ? (
         acts.map((a, i) => (
           <div className="ai-act" key={i}>

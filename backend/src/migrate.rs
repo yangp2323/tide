@@ -92,6 +92,7 @@ pub fn run(store: &Store, old: &Path) -> Result<()> {
                 exit_reason: v["exit_reason"].as_str().map(str::to_string),
                 entry_fee: 0.0,
                 stop_dist: 0.0,
+                entry_reason: String::new(),
                 funding: 0.0,
             });
         }

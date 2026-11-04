@@ -226,6 +226,9 @@ pub struct Trade {
     /// Initial stop distance as a price fraction; 0 for trades opened before ATR stops.
     #[serde(default)]
     pub stop_dist: f64,
+    /// Why the AI opened this trade; shown back to it on later runs.
+    #[serde(default)]
+    pub entry_reason: String,
     /// Open trade: funding already booked into closed slices. Closed trade: its own
     /// funding (negative is a cost). Futures only.
     #[serde(default)]
