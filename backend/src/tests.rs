@@ -607,6 +607,7 @@ struct Sim {
     orders: HashMap<String, Value>,
     positions: Vec<Value>,
     external: Vec<Value>,
+    manual_orders: Vec<Value>,
     calls: Vec<(String, Value)>,
 }
 async fn sim_exchange(
@@ -700,7 +701,7 @@ async fn sim_exchange(
             None if q.get("orderFilter").is_some_and(|f| f == "StopOrder") => {
                 json!({"list":s.orders.iter().filter(|(_, o)| o["orderStatus"] == "Untriggered").map(|(k, o)| { let mut o = o.clone(); o["orderLinkId"] = json!(k); o }).collect::<Vec<_>>()})
             }
-            None => json!({"list":[]}),
+            None => json!({"list":s.manual_orders.clone()}),
         },
         "/v5/execution/list" => match q.get("orderId") {
             Some(id) => {
@@ -807,6 +808,41 @@ async fn futures_stops_follow_ai_trail_and_external_take_profit() {
         .unwrap();
     let snap = app.snapshot().await.unwrap();
     assert_eq!(snap["open_positions"][0]["entry_reason"], "突破后回踩确认");
+    assert_eq!(snap["open_positions"][0]["leverage"], 5);
+    assert_eq!(snap["account"]["available_usdt"], 1000.0);
+    // The exchange's own view is sent live: the bot's position is flagged as its own and a
+    // position and an order the operator placed by hand are shown as theirs.
+    {
+        let mut s = sim.lock().await;
+        s.positions.push(json!({"symbol":"ETHUSDT","side":"Sell","size":"2","leverage":"3","avgPrice":"2000","markPrice":"1990","liqPrice":"2600","positionValue":"4000","positionIM":"1333","unrealisedPnl":"20","stopLoss":"0","takeProfit":"0","positionIdx":"0"}));
+        s.manual_orders.push(json!({"symbol":"ETHUSDT","side":"Buy","orderType":"Limit","qty":"1","price":"1800","triggerPrice":"0","orderStatus":"New","orderLinkId":"my-own-order"}));
+    }
+    let live = app.snapshot().await.unwrap()["exchange_live"].clone();
+    assert_eq!(live["available"], true, "{live}");
+    let own = live["positions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["pair"] == "BTC/USDT:USDT")
+        .unwrap()
+        .clone();
+    assert_eq!(own["managed_by_tide"], true);
+    let manual = live["positions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["pair"] == "ETHUSDT")
+        .unwrap()
+        .clone();
+    assert_eq!(manual["managed_by_tide"], false);
+    assert_eq!(manual["side"], "short");
+    assert!((manual["liquidation_distance_pct"].as_f64().unwrap() - 30.65).abs() < 0.1);
+    assert_eq!(live["open_orders"][0]["placed_by_tide"], false);
+    {
+        let mut s = sim.lock().await;
+        s.positions.retain(|p| p["symbol"] != "ETHUSDT");
+        s.manual_orders.clear();
+    }
     assert_eq!(
         snap["previous_runs"][0]["notes_to_self"],
         "BTC 多单：跌破 9.6 失效"
