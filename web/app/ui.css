@@ -1,0 +1,221 @@
+/* 在 globals.css 之外新增的样式：导航、弹层、提示、骨架屏、移动端底部标签栏。
+   globals.css 是原来单页版的设计系统，保持不动。 */
+
+/* ---------- 侧边栏补充 ---------- */
+.side-time { margin-top: 4px; font: 11px var(--mono); color: var(--side-dim); }
+.drawer-scrim { position: fixed; inset: 0; z-index: 19; background: rgba(10, 15, 22, .45); }
+
+/* 并排的卡片各自按内容高度，不要互相拉高留出空白 */
+.grid { align-items: start; }
+
+/* ---------- 顶栏 ---------- */
+.icon-btn { padding: 6px 8px; line-height: 0; color: var(--ink); }
+.icon-btn svg { width: 16px; height: 16px; }
+.icon-btn.spin svg { animation: spin .8s linear infinite; }
+.banner { margin: 0 0 16px; }
+
+/* 标题不换行，右侧的开关按钮不被挤压 */
+.bar h1 { flex: 0 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar-in > button, .bar-in > .pill { flex: none; }
+.bar-in button { white-space: nowrap; }
+.menu-btn { padding: 6px 8px; line-height: 0; }
+.menu-btn svg { width: 18px; height: 18px; }
+
+/* ---------- 键值小表格（概览里的"当前设置"） ---------- */
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-size: 13px; }
+.kv b { font-weight: 600; }
+.kv .pairs { font-family: var(--display); font-stretch: 88%; }
+
+/* ---------- 骨架屏 ---------- */
+.skel { display: grid; gap: 9px; padding: 6px 0; }
+.skel span {
+  display: block; border-radius: 6px;
+  background: linear-gradient(90deg, #eaeef2 25%, #f6f8fa 37%, #eaeef2 63%);
+  background-size: 400% 100%; animation: skel 1.4s ease infinite;
+}
+@keyframes skel { from { background-position: 100% 50%; } to { background-position: 0 50%; } }
+
+/* ---------- 弹层（替代 confirm） ---------- */
+.scrim {
+  position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; padding: 20px;
+  background: rgba(10, 15, 22, .48); backdrop-filter: blur(2px); animation: fade .12s ease-out;
+}
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+.modal {
+  width: min(440px, 100%); background: #fff; border-radius: 12px; padding: 20px 22px;
+  box-shadow: 0 18px 48px rgba(15, 23, 34, .32); animation: pop .14s ease-out;
+}
+@keyframes pop { from { transform: translateY(6px) scale(.98); opacity: .6; } to { transform: none; opacity: 1; } }
+.modal h3 { margin: 0 0 8px; font-size: 16px; }
+.modal-body { color: var(--muted); font-size: 14px; line-height: 1.65; }
+.modal input { margin-top: 14px; }
+.modal-acts { justify-content: flex-end; margin-top: 18px; }
+
+/* ---------- toast ---------- */
+.toasts {
+  position: fixed; z-index: 70; left: 50%; bottom: 26px; transform: translateX(-50%);
+  display: grid; gap: 8px; width: max-content; max-width: calc(100vw - 32px); pointer-events: none;
+}
+.toast {
+  padding: 10px 16px; border-radius: 999px; font-size: 13px; font-weight: 600; color: #fff;
+  background: var(--ink); box-shadow: 0 10px 26px rgba(15, 23, 34, .28); animation: toast-in .18s ease-out;
+}
+.toast.err { background: var(--down); }
+.toast.warn { background: var(--amber); color: #1c1300; }
+@keyframes toast-in { from { transform: translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+/* ---------- 移动端底部标签栏 ---------- */
+.tabbar { display: none; }
+
+@media (max-width: 640px) {
+  /* 顶栏在小屏只留菜单、标题、刷新和启停；市场信息在侧边栏和概览里都有 */
+  .bar .pill.live { display: none; }
+  .bar h1 { font-size: 17px; }
+  .bar-in { gap: 8px; }
+  .hide-sm { display: none; }
+
+  /* 概览的 K 线钟和标题并排，不再上下堆叠 */
+  .hero { flex-direction: row; align-items: center; gap: 14px; }
+  .clock { width: 86px; height: 86px; }
+  .hero h3 { font-size: 18px; }
+}
+
+@media (max-width: 900px) {
+  .tabbar {
+    display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 18;
+    background: rgba(255, 255, 255, .96); backdrop-filter: blur(8px);
+    border-top: 1px solid var(--line); padding: 6px 4px calc(6px + env(safe-area-inset-bottom));
+  }
+  .tabbar .tab {
+    flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px; position: relative;
+    padding: 4px 0; border: 0; background: none; color: var(--muted); font: 500 11px/1.2 var(--cjk);
+    text-decoration: none; cursor: pointer;
+  }
+  .tabbar .tab.on { color: var(--ink); font-weight: 700; }
+  .tabbar .tab svg { width: 20px; height: 20px; }
+  .tabbar .dot-badge {
+    position: absolute; top: 0; right: 50%; transform: translateX(16px);
+    font: 600 10px/1 var(--mono); padding: 3px 5px; border-radius: 6px; background: var(--amber); color: #1c1300;
+  }
+  .content { padding-bottom: 96px; }
+  .savebar { bottom: calc(58px + env(safe-area-inset-bottom)) !important; }
+  .toasts { bottom: calc(70px + env(safe-area-inset-bottom)); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skel span, .toast, .modal, .scrim, .icon-btn.spin svg { animation: none; }
+}
+
+/* 概览铺满可用宽高，行间距由 dashboard 统一控制。 */
+.content.overview-content { max-width: none; width: 100%; padding-bottom: 22px; }
+.overview-dashboard {
+  display: grid;
+  gap: 16px;
+  min-height: calc(100svh - 100px);
+  grid-template-rows: auto auto auto minmax(220px, 1fr);
+}
+.overview-dashboard > .grid { align-items: stretch; min-width: 0; }
+.overview-dashboard > .grid,
+.overview-dashboard > .card,
+.overview-dashboard .grid > .card { margin-top: 0; }
+.overview-dashboard .card { min-width: 0; }
+.overview-top .hero { height: 100%; }
+.overview-bottom > .card { display: flex; flex-direction: column; }
+.overview-bottom .bars { flex: 1; min-height: 120px; height: auto; }
+.overview-bottom .empty { flex: 1; display: grid; place-items: center; }
+.overview-bottom .scroll { flex: 1; }
+@media (max-width: 1080px) {
+  .overview-dashboard { min-height: auto; grid-template-rows: none; }
+}
+@media (max-width: 900px) {
+  .content.overview-content { padding-bottom: 96px; }
+}
+
+/* 所有后台页面共享全宽工作区，与概览保持一致。 */
+.content.workspace-content {
+  width: 100%;
+  max-width: none;
+  min-height: calc(100svh - 56px);
+  padding-bottom: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.workspace-content > .card,
+.workspace-content > .grid,
+.workspace-content > .msg,
+.workspace-content > .savebar { margin-top: 0; }
+.workspace-content .grid { align-items: stretch; }
+.workspace-content .grid > .card { margin-top: 0; }
+.workspace-content .card,
+.workspace-content .grid { min-width: 0; }
+.workspace-content > .card,
+.workspace-content > .grid > .card { display: flex; flex-direction: column; }
+.workspace-content > .card > .empty,
+.workspace-content > .grid > .card > .empty {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  min-height: 140px;
+}
+.page-ai > .card,
+.page-positions > .card,
+.page-trades > .card,
+.page-notify > .card,
+.page-account > .grid { flex: 1; }
+.page-trades > .card > .scroll { flex: 1; }
+.page-trades .pager { margin-top: auto; padding-top: 16px; flex-wrap: wrap; }
+.page-strategy > .card:nth-of-type(2) { flex: 1; }
+.page-strategy > .savebar { margin-top: auto; }
+.page-logs > .card { min-height: 320px; height: calc(100svh - 100px); }
+.page-logs .logbox { flex: 1; min-height: 180px; max-height: none; }
+.workspace-content > .banner { margin: 0; flex: none; }
+@media (max-width: 900px) {
+  .content.workspace-content { min-height: calc(100svh - 56px); padding-bottom: 96px; }
+  .page-logs > .card { height: calc(100svh - 174px); }
+}
+@media (max-width: 760px) {
+  .workspace-content > .card,
+  .workspace-content > .grid { flex: none; }
+  .workspace-content > .grid > .card { min-height: 0; }
+  .workspace-content > .card > .empty,
+  .workspace-content > .grid > .card > .empty { min-height: 100px; }
+  .page-logs > .card { height: calc(100svh - 174px); min-height: 320px; }
+}
+
+/* AI configuration shares control sizing, focus states and a responsive form grid. */
+.page-ai > .g2 { grid-template-columns: minmax(0, .85fr) minmax(0, 1.35fr); align-items: start; }
+.ai-settings .ai-provider { display: flex; width: 100%; margin-bottom: 4px; }
+.ai-settings .ai-provider button { flex: 1; min-height: 42px; }
+.ai-settings .ai-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 16px; margin-top: 18px; }
+.ai-settings .ai-fields > div { min-width: 0; }
+.ai-settings .ai-model-options { margin: 16px 0; padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--soft); }
+.ai-settings label.f { color: var(--ink); font-weight: 600; margin: 16px 0 7px; }
+.ai-settings .ai-fields label.f { margin-top: 0; }
+.ai-settings input, .ai-settings select {
+  width: 100%; min-width: 0; min-height: 44px; padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: 8px; background-color: var(--card);
+  color: var(--ink); font: inherit; transition: border-color .15s, box-shadow .15s;
+}
+.ai-settings select {
+  appearance: none; cursor: pointer; padding-right: 36px; background-repeat: no-repeat;
+  background-position: right 12px center; background-size: 14px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%235d6a79' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m4 6 4 4 4-4'/%3E%3C/svg%3E");
+}
+.ai-settings input:hover, .ai-settings select:hover { border-color: #aab6c2; }
+.ai-settings input:focus, .ai-settings select:focus { border-color: var(--amber); outline: none; box-shadow: 0 0 0 3px rgba(224,149,10,.13); }
+.ai-settings input:focus-visible, .ai-settings select:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+.ai-settings .hint { margin-top: 8px; line-height: 1.7; overflow-wrap: anywhere; }
+.ai-settings .ai-budget { grid-column: 1 / -1; padding-top: 14px; border-top: 1px solid var(--line); }
+.ai-settings .ai-budget input { max-width: 240px; }
+.ai-settings > .row { justify-content: flex-end; margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--line); }
+.ai-settings > .row button { min-width: 104px; min-height: 42px; }
+@media (max-width: 760px) {
+  .page-ai > .g2 { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 600px) {
+  .ai-settings .ai-fields { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  .ai-settings .ai-model-options { padding: 14px; }
+  .ai-settings input, .ai-settings select { font-size: 16px; }
+  .ai-settings .ai-budget input, .ai-settings > .row button { max-width: none; width: 100%; }
+}

@@ -1,82 +1,127 @@
-# Tide · Bybit 量化交易
+# Tide · Rust + Next.js 量化交易
 
-Bybit 自动交易（现货或 USDT 永续合约），全部跑在东京服务器上（38.175.201.84），电脑关机不影响。
+Bybit 实盘交易管理平台。后端和交易引擎全部使用 Rust，前端使用 Next.js 静态构建。服务器直接运行二进制程序，通过 systemd 管理；运行时不依赖 Docker、Python、Freqtrade 或 Node.js。
 
-## 管理后台（随时可访问，手机也能用）
+管理后台：[trade.juyouagent.com](https://trade.juyouagent.com)。首次从旧版迁移后交易保持暂停，核对账户和配置后在页面启动。
 
-**https://trade.juyouagent.com**（juyouagent.com 也能打开；必须输入 https://，用 IP 访问会被拒绝），登录账号密码在 `deploy/secrets/服务器信息.md`
+## 项目结构
 
-左侧菜单：
-
-| 页面 | 做什么 |
-| --- | --- |
-| 概览 | 当前状态、距离 K 线收盘的倒计时、账户和收益、每个币离开仓还差什么、近 30 天每日盈亏 |
-| 持仓 | 当前持仓（合约会显示杠杆、爆仓价、止损价），可以手动市价平仓 |
-| 交易记录 | 全部已平仓交易，分页 |
-| AI 交易 | 让大模型（Claude 或 OpenAI 兼容接口）每根 K 线收盘后分析并开平仓，带硬性风控和决策记录 |
-| 策略与选币 | 现货 / USDT 永续合约、杠杆 1–10 倍、是否做空、同时持仓数、从 Bybit 选币（最多 12 个）、回测近两年 |
-| 账户与资金 | Bybit API Key、机器人最多可动用的 USDT |
-| 通知 | Telegram |
-| 运行日志 | 机器人最近 300 条日志 |
-
-- **只跑实盘**（模拟盘已移除）：机器人直接用 Bybit 账户里的真钱交易
-- Key 权限：现货只勾「现货 - 交易」，合约勾「合约 - 订单」和「合约 - 持仓」；都不要勾提现，IP 白名单填服务器 IP
-- 资金上限选填，不填就用账户里全部 USDT；都要保证每笔至少 10 USDT（同时持仓 3 笔时至少 32 USDT），余额不够时机器人不会开仓
-- 合约用**逐仓**：每笔保证金独立，一笔爆仓不牵连其他仓位。止损单挂在 Bybit 上，机器人停了也有效
-- 现货的止损由机器人执行（Freqtrade 不支持 Bybit 现货交易所止损单），机器人暂停时不会止损
-- 有持仓时不能改市场、杠杆、做空，要先平仓
-
-## 策略
-
-`strategies/TrendFollow.py`：4 小时趋势跟踪，默认 BTC/ETH/SOL 现货只做多（后台里可改）。
-- 做多：价格在 200 均线上方，20 均线上穿 50 均线，ADX > 20；死叉平仓
-- 做空（仅合约、需开启）：价格在 200 均线下方，20 均线下穿 50 均线，ADX > 20；金叉平仓
-- 止损和移动止盈按**价格**算：不论几倍杠杆，价格反向 8% 止损；盈利 6% 后启动 3% 移动止盈。所以 3 倍杠杆一次止损亏掉保证金的 24%
-- 杠杆上限 10 倍：再高的话价格还没走到 8% 就先爆仓
-
-回测（BTC/ETH/SOL，近两年，本金 1000，最多 3 笔；现货手续费 0.1%，合约 0.06% 并含资金费率）：
-
-| 方式 | 收益 | 最大回撤 |
-| --- | --- | --- |
-| 现货只做多 | +6.97% | 6.2% |
-| 合约 1× 只做多 | +4.06% | 7.3% |
-| 合约 2× 只做多 | +8.57% | 14.6% |
-| 合约 3× 只做多 | +10.72% | 21.8% |
-| 合约 5× 只做多 | +13.85% | 34.4% |
-| 合约 1× 多空 | -1.68% | 17.1% |
-| 合约 3× 多空 | -7.88% | 46.0% |
-| 合约 5× 多空 | -24.40% | 66.6% |
-| 合约 10× 多空 | -72.20% | 92.6% |
-
-做空部分整体亏钱；杠杆越高，收益涨得慢、回撤涨得快。加更多小币也会变差（现货主流 8 个 -0.58%，成交额前 10 个 -7.03%）。样本少，不代表未来。
-
-## AI 交易
-
-后台「AI 交易」页开启后，`TrendFollow` 的均线信号停用，改由大模型决定开仓、平仓（`deploy/freqtrade/panel/ai.py`）：
-- 每 4 小时（或每小时）K 线收盘 3 分钟后，把账户、持仓、每个币最近 60 根 K 线和指标发给大模型，它返回 JSON 决策，后台用市价单执行
-- **硬性风控**（代码里检查，大模型绕不过）：只能交易已选的币、持仓上限、每天开仓次数上限、当日亏损达到上限停止开仓、低于置信度不执行、现货不能做空
-- 每笔金额、杠杆、价格反向 8% 止损、移动止盈仍由系统执行
-- 决策记录存在服务器 `user_data/ai/decisions.jsonl`，配了 Telegram 会推送
-
-**外部接入**（都要后台登录账号，Basic Auth）：
-- `GET /api/ai/snapshot` 行情快照、`POST /api/ai/order` 下单（`{"action": "open_long|open_short|close", "pair": "BTC/USDT", "reason": "…"}`，同样过风控）、`POST /api/ai/run?execute=false` 让服务器上的模型分析一次、`GET /api/ai/log` 决策记录
-- MCP（给 Claude Code / Claude Desktop 用）：`mcp/trade_mcp.py`，需要本地 `pip install mcp httpx`
-  ```bash
-  claude mcp add bybit-trade -e PANEL_PASS=后台密码 -- python D:/coding/tide/mcp/trade_mcp.py
-  ```
-
-## 服务器上的结构
-
-`/opt/tide`：Docker 跑五个容器——`tide-bot`（交易机器人）、`tide-panel`（内部 FastAPI：策略、回测、AI）、`tide-web`（Next.js：页面、登录、`/api` 入口）、`tide-caddy`（HTTPS）、`tide-sni`（443 端口按域名分流：juyouagent.com 走控制台，其余走 sing-box 代理）。
-Key 和 Telegram 只存在服务器 `user_data/config-private.json`（权限 600）。
-
-公网只认 Next.js：Caddy 反代到 `web:3000`，登录态是 HMAC 签名 Cookie（`__Host-tide_session`，12 小时）；`web` 的 Route Handler 带内部令牌转发给 `panel:8000`，Python 服务不对外暴露。
-
-重新部署（`node_modules` 有几百 MB，用 tar 打包再传）：
-```bash
-tar -czf deploy.tgz --exclude=node_modules --exclude=.next --exclude=out -C deploy/freqtrade . \
-  && scp deploy.tgz strategies/TrendFollow.py root@38.175.201.84:/root/ \
-  && ssh root@38.175.201.84 "tar -xzf /root/deploy.tgz -C /opt/tide && mv -f /root/TrendFollow.py /opt/tide/ && rm -f /root/deploy.tgz && bash /opt/tide/setup.sh"
+```text
+backend/src/
+  main.rs          服务入口、systemd 信号处理
+  api.rs           管理接口、账户、策略设置
+  auth.rs          scrypt 密码、HMAC 会话、Origin 检查
+  exchange.rs      Bybit V5 签名、行情、下单及成交查询
+  engine.rs        仓位、订单恢复、风控、止损
+  indicators.rs    EMA / ADX / RSI / ATR
+  ai.rs            Anthropic / OpenAI 兼容模型、定时决策
+  store.rs         SQLite 订单、交易、决策和日志
+  migrate.rs       旧版配置、登录及历史交易导入
+  mcp.rs           MCP stdio 客户端
+  tests.rs         模拟交易所及 HTTP 集成测试
+web/               Next.js / React / TypeScript 页面
+deploy/native/     构建脚本、原生服务、HTTPS 与 443 分流
 ```
 
-`setup.sh` 可重复执行：不会覆盖 `.env`、Key、交易记录；`web` 是挂载源码 + `next dev`，只改页面时直接改服务器 `/opt/tide/web` 就会热更新，不用重启。
+## 架构
+
+```text
+浏览器 → Nginx SNI :443 → Caddy HTTPS :8443 → Rust :8000
+                                              ├─ Next.js 静态页面
+                                              ├─ 管理 / AI / MCP API
+                                              ├─ SQLite
+                                              └─ Bybit V5 REST
+其他 TLS 域名 → 原有 sing-box :8444
+```
+
+Next.js 只用于开发和构建。部署包包含一个静态链接的 Rust 程序及 `web/` 静态资源；HTTPS 和分流同样以本机二进制服务运行。
+
+## 本地构建
+
+需要 Rust stable、musl 工具链、Node.js 和 pnpm（仅构建时）。Linux / WSL：
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+sudo apt-get install musl-tools
+bash deploy/native/build.sh
+```
+
+产物：`dist/tide-linux-amd64.tgz`。依赖由 `Cargo.lock` 和 `web/pnpm-lock.yaml` 固定。
+
+单独检查：
+
+```bash
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cd web && pnpm install --frozen-lockfile && pnpm build
+```
+
+## 原生部署
+
+服务器部署目录 `/opt/tide`，SSH 名称 `s-tokyo`。详细流程见 [部署说明](deploy/README.md)。
+
+后续线上更新在项目根目录的 Linux / WSL 终端运行 `make depoly`（也支持 `make deploy`），自动测试、构建、备份、部署和检查，失败时回退代码。
+
+```text
+/opt/tide/bin/caddy             HTTPS 二进制
+/opt/tide/releases/<版本>/tide  Rust 二进制
+/opt/tide/releases/<版本>/web/  Next.js 静态资源
+/opt/tide/current              当前版本软链接
+/opt/tide/data/config.json     配置和 API 密钥，权限 600
+/opt/tide/data/auth.json       管理员密码哈希，权限 600
+/opt/tide/data/tide.sqlite     交易、订单、决策、运行日志
+/opt/tide/caddy-data/          HTTPS 证书
+/etc/tide/tide.env             环境配置，权限 600
+```
+
+服务管理：
+
+```bash
+systemctl status tide tide-caddy tide-sni
+journalctl -u tide -f
+curl http://127.0.0.1:8000/healthz
+```
+
+首次初始化新账户：设置 `TIDE_DATA_DIR`、`TIDE_ADMIN_PASSWORD`，执行 `tide init`。密码仅在初始化时需要；已有配置不会被覆盖。
+
+旧版迁移：停止旧引擎并核对所有机器人仓位和挂单后，执行 `TIDE_DATA_DIR=/opt/tide/data tide migrate /opt/tide/user_data`。发现任一旧实盘库有未平仓记录就拒绝导入。导入现货和合约历史交易、登录密码、API Key、Telegram、AI 配置和决策记录，不导入模拟盘记录。旧数据原样保留。
+
+## 策略与交易行为
+
+- AI 使用 4 小时收盘 K 线和技术指标进行分析并决定开仓、持有或平仓；系统不再运行独立的均线自动交易策略。
+- 默认暂停开仓。暂停时，已有仓位的止损和移动止盈继续执行。
+- 最大持仓数只限制同时持仓数量，不要求资金足够开满。开仓预算预留 5% 后，按剩余名额与实际能支持的笔数分配；最低下单金额和数量以交易所对该币种的要求为准，不额外设置每笔 10 USDT 的门槛。
+- 初始价格止损 8%；盈利达到 6% 后启动 3% 移动止盈；按价格计算，杠杆会放大本金盈亏。
+- 市价单执行；交易所可能部分成交或拒绝成交。确认实际成交数量、价格和手续费后才更新本地仓位。
+- 下单前将唯一订单号持久化。超时先核对成交，不盲目重发。存在待确认订单时禁止新开仓，重启后继续核对。
+- 所有下单入口串行检查持仓、资金和风控。AI 自动执行和手动分析执行采用相同置信度限制；外部明确下单不接收模型置信度。
+- 合约支持设置 1–25 倍杠杆，并校验交易对在交易所的杠杆上限；现货保持 1 倍。合约要求 Bybit 统一账户使用逐仓、单向持仓模式。合约止损挂在交易所，并同步实际平仓；不合并已有的手动合约仓位。
+- 现货止损由 Rust 服务执行，服务关闭期间无法执行。现货平仓精度以下余额记为零碎余额，仍可在 Bybit 账户中查看。
+- 自动交易只由 AI 决策，不再运行均线策略；不限制每日开仓次数。平仓释放名额后，AI 可继续开多或开空（需允许做空）。待确认订单仍会阻止新开仓，当日亏损和置信度限制继续执行。
+- AI 以账户净盈利增长为目标，结合手续费、滑点与适用的资金费评估交易机会；根据后续预期收益判断开仓、持有和平仓，不以单笔回本为目标。分析须说明具体行情依据；未达到日亏损上限仅表示通过一项开仓限制，不代表存在盈利机会。现有风控仍生效，缺乏正预期收益依据时可以不交易。
+
+实盘汇总以本地记录的成交和交易费用为基础，不能代替交易所账单（例如合约资金费及外部交易会影响账户权益）。
+
+## AI 与外部接入
+
+接口地址填根域名时，OpenAI 兼容模式会自动补 `/v1`（例如 `https://api.onerouter.com` → `/v1/responses`）；完整端点与自定义路径前缀保留原路径。所有模型请求明确使用非流式 JSON；收到 HTML 网页会提示实际请求地址，避免误报为模型回答的 JSON 格式错误。
+
+OpenAI 兼容模式可选择 Chat Completions 或 Responses，以及模型支持的思考等级。旧配置默认 Chat Completions、思考等级为“服务商默认”（不传参数），不会自动切换接口或提升等级。Responses 使用 `reasoning.effort`，Chat Completions 使用 `reasoning_effort`；不支持的参数会显示服务商错误。Claude 使用 Messages 接口，可独立配置自适应思考、手动预算或关闭（以模型支持为准），思考等级通过 `output_config.effort` 发送；手动预算为 1024–15999 tokens，总输出上限保持 16000。旧配置不额外传参，保留服务商默认行为。地址可填写服务商基础地址或完整端点；模型输出不完整或拒绝生成时不执行交易。
+
+AI 支持 Anthropic 和 OpenAI 兼容接口。分析间隔可自定义为 1–1440 分钟，另可设置计划时间后的延迟秒数（必须小于间隔）；默认每 4 小时、延迟 180 秒。按固定时间轴对齐，下次运行时间显示在页面；修改后从下一个计划时间生效，不立即补跑。行情使用 4 小时已收盘 K 线。模型请求期间不锁住止损线程，执行前重新读取风控状态；分析未结束时不会并发运行另一轮。
+
+所有 API 先 `POST /api/auth/login`（JSON `username` / `password`）获取会话 Cookie。写请求必须带与 `TIDE_PUBLIC_ORIGIN` 相同的 `Origin`。Basic Auth 已移除。
+
+- `GET /api/ai/snapshot`：行情和持仓快照。
+- `POST /api/ai/order`：`{"action":"open_long|open_short|close","pair":"BTC/USDT","reason":"…"}`。
+- `POST /api/ai/run?execute=false`：分析；`true` 会按风控执行。
+- `GET /api/orders/pending`：待核对订单。结果不确定时不要手动重复下单。
+- `GET /api/ai/log`：决策记录。
+
+Rust 程序同时提供 MCP stdio 模式，不需要 Python：
+
+```bash
+claude mcp add tide-trade -e PANEL_PASS=后台密码 -- /path/to/tide mcp
+```
+
+可选环境变量：`PANEL_URL`、`PANEL_USER`。MCP 客户端自动登录、保存会话并发送正确的 Origin。Linux 发布包用于 Linux；Windows 本地 MCP 需要通过 WSL 运行，或用 Cargo 构建对应平台二进制。

@@ -1,0 +1,20 @@
+{
+    auto_https disable_redirects
+    https_port 8443
+    cert_issuer acme {
+        disable_http_challenge
+    }
+    servers {
+        strict_sni_host on
+    }
+}
+
+trade.{$DOMAIN} {
+    bind 127.0.0.1
+    reverse_proxy 127.0.0.1:8000
+}
+
+{$DOMAIN}, www.{$DOMAIN} {
+    bind 127.0.0.1
+    redir https://trade.{$DOMAIN}{uri} permanent
+}

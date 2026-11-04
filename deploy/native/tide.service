@@ -1,0 +1,27 @@
+[Unit]
+Description=Tide Rust trading service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tide
+Group=tide
+WorkingDirectory=/opt/tide/current
+EnvironmentFile=/etc/tide/tide.env
+ExecStart=/opt/tide/current/tide
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/tide/data
+MemoryMax=700M
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

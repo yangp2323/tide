@@ -15,3 +15,7 @@ deploy/freqtrade/panel/web/
 deploy.tgz
 .preview/
 deploy/freqtrade/user_data/
+target/
+data/
+dist/
+*.tgz

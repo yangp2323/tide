@@ -1,0 +1,25 @@
+[Unit]
+Description=Tide HTTPS proxy
+After=network-online.target tide.service
+Wants=network-online.target
+
+[Service]
+User=tide
+Group=tide
+EnvironmentFile=/etc/tide/tide.env
+Environment=XDG_DATA_HOME=/opt/tide/caddy-data
+Environment=XDG_CONFIG_HOME=/opt/tide/caddy-config
+ExecStart=/opt/tide/bin/caddy run --config /etc/tide/Caddyfile --adapter caddyfile
+ExecReload=/opt/tide/bin/caddy reload --config /etc/tide/Caddyfile --adapter caddyfile
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/tide/caddy-data /opt/tide/caddy-config
+MemoryMax=150M
+
+[Install]
+WantedBy=multi-user.target
