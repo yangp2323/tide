@@ -652,7 +652,10 @@ async fn sim_exchange(
             let step: i64 = if q.get("interval").is_some_and(|i| i == "D") {
                 86_400_000
             } else {
-                14_400_000
+                q.get("interval")
+                    .and_then(|i| i.parse::<i64>().ok())
+                    .unwrap_or(240)
+                    * 60_000
             };
             let end = chrono::Utc::now().timestamp_millis() / step * step - step;
             if q.get("limit").is_some_and(|l| l == "2") {
@@ -829,6 +832,21 @@ async fn futures_stops_follow_ai_trail_and_external_take_profit() {
     assert_eq!(snap["pairs"][0]["market_stats"]["last_price"], 10.0);
     assert_eq!(snap["pairs"][0]["forming_4h_candle"]["high_so_far"], 10.4);
     assert_eq!(snap["pairs"][0]["forming_4h_candle"]["last"], 10.2);
+    // Short-term candles sit next to the 4h chart, each at its own interval.
+    let short = &snap["pairs"][0]["short_term"];
+    for (key, rows, minutes) in [("1h", 24, 60), ("15m", 32, 15)] {
+        let list = short[key].as_array().unwrap();
+        assert_eq!(list.len(), rows);
+        let time = |row: &serde_json::Value| {
+            chrono::NaiveDateTime::parse_from_str(row[0].as_str().unwrap(), "%Y-%m-%d %H:%M")
+                .unwrap()
+        };
+        assert_eq!((time(&list[1]) - time(&list[0])).num_minutes(), minutes);
+        assert_eq!(
+            list[0].as_array().unwrap().len(),
+            short["columns"].as_array().unwrap().len()
+        );
+    }
     assert_eq!(snap["account"]["available_usdt"], 1000.0);
     // Account-level loss limits belong to the system; the model is not shown them.
     let text = snap.to_string();
