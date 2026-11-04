@@ -72,6 +72,15 @@ pub fn stop_distance(atr: f64, price: f64) -> Option<f64> {
 pub fn trade_leverage(max: u32, stop: f64) -> u32 {
     ((0.6 / stop + 1e-9).floor() as u32).clamp(1, max.max(1))
 }
+/// Per-trade leverage ceiling: the configured maximum, but never above the symbol's own limit
+/// (which can be fractional, e.g. 12.5×).
+pub fn leverage_cap(configured: u32, symbol_max: f64) -> u32 {
+    if symbol_max.is_finite() && symbol_max >= 1.0 {
+        configured.min(symbol_max.floor() as u32)
+    } else {
+        1
+    }
+}
 /// Margin that loses `risk_pct` percent of `equity` if the stop is hit (before fees and slippage).
 pub fn risk_stake(equity: f64, risk_pct: f64, stop: f64, leverage: u32) -> f64 {
     equity * risk_pct / 100.0 / stop / leverage as f64
@@ -371,7 +380,10 @@ impl App {
             .map_or(0.0, |x| x.atr);
         let stop = stop_distance(atr, price).context("ATR 无效，无法计算止损")?;
         let leverage = if futures {
-            trade_leverage(c.leverage, stop)
+            trade_leverage(
+                leverage_cap(c.leverage, num(&ins["leverageFilter"]["maxLeverage"])),
+                stop,
+            )
         } else {
             1
         };
@@ -394,10 +406,6 @@ impl App {
                     .iter()
                     .any(|p| p["symbol"] == sym && num(&p["positionIdx"]) != 0.0),
                 "该合约不是单向持仓模式，请先在 Bybit 修改"
-            );
-            ensure!(
-                leverage as f64 <= num(&ins["leverageFilter"]["maxLeverage"]),
-                "交易对杠杆上限不足"
             );
             if let Err(e)=ex.post("/v5/position/set-leverage",json!({"category":"linear","symbol":sym,"buyLeverage":leverage.to_string(),"sellLeverage":leverage.to_string()})).await {
                 // 110043 means leverage is already set to the requested value.
@@ -566,6 +574,14 @@ impl App {
             .await;
         Ok(())
     }
+    /// Move the exchange-hosted stop. Bybit answers 34040 when the rounded price equals the
+    /// current stop; that is already the wanted state, not a failure.
+    async fn set_stop(&self, ex: &Bybit, t: &Trade, price: &str) -> Result<()> {
+        match ex.post("/v5/position/trading-stop",json!({"category":"linear","symbol":symbol(&t.pair),"tpslMode":"Full","positionIdx":0,"stopLoss":price,"slTriggerBy":"LastPrice"})).await {
+            Err(e) if !e.downcast_ref::<crate::exchange::Rejected>().is_some_and(|r| r.1 == 34040) => Err(e),
+            _ => Ok(()),
+        }
+    }
     pub async fn sync_external_exit(&self, c: &Config, t: &Trade, ex: &Bybit) -> Result<bool> {
         let positions = ex.positions().await?;
         let amount: f64 = positions
@@ -594,7 +610,7 @@ impl App {
             if (num(&p["stopLoss"]) - desired.parse::<f64>()?).abs()
                 > num(&ins["priceFilter"]["tickSize"]) * 0.5
             {
-                ex.post("/v5/position/trading-stop",json!({"category":"linear","symbol":symbol(&t.pair),"tpslMode":"Full","positionIdx":0,"stopLoss":desired,"slTriggerBy":"LastPrice"})).await?;
+                self.set_stop(ex, t, &desired).await?;
             }
             return Ok(false);
         }
@@ -625,6 +641,11 @@ impl App {
                         e["side"] == if t.is_short { "Buy" } else { "Sell" }
                             && num(&e["closedSize"]) > 0.0
                             && e["execType"] == "Trade"
+                            // The bot's own partial closes are already settled into t.amount.
+                            && !e["orderLinkId"]
+                                .as_str()
+                                .filter(|l| !l.is_empty())
+                                .is_some_and(|l| self.store.has_order(l).unwrap_or(false))
                     })
                     .cloned(),
             );
@@ -676,38 +697,46 @@ impl App {
         // Risk exits continue while new entries are paused.
         let mut risk_errors = Vec::new();
         for mut t in self.store.open_trades()? {
-            let result:Result<()>=async {
-            if self.store.unresolved()?.iter().any(|o| o["pair"] == t.pair) {
-                return Ok(());
+            let result: Result<()> = async {
+                if self.store.unresolved()?.iter().any(|o| o["pair"] == t.pair) {
+                    return Ok(());
+                }
+                if t.market == "futures" && self.sync_external_exit(&c, &t, &ex).await? {
+                    return Ok(());
+                }
+                let price = ex.price(&t.market, &t.pair).await?;
+                let (peak, stop) = stop_price(&t, price);
+                let previous = t.stop_loss_abs;
+                // Persist first: if the exchange update fails, the next sync_external_exit
+                // sees the difference and restores the stop from this record.
+                t.peak = peak;
+                t.stop_loss_abs = stop;
+                self.store.update_trade(&t)?;
+                if t.market == "futures" && stop != previous {
+                    let ins = ex.instrument(&t.market, &t.pair).await?;
+                    let tick = ins["priceFilter"]["tickSize"]
+                        .as_str()
+                        .context("缺少价格精度")?;
+                    let desired = quantize(stop, tick)?;
+                    // Moves smaller than one tick round to the current stop; nothing to send.
+                    if desired != quantize(previous, tick)? {
+                        self.set_stop(&ex, &t, &desired).await?;
+                    }
+                }
+                if t.market == "spot" && price <= stop {
+                    self.close_position(
+                        t.trade_id,
+                        if peak >= t.open_rate * (1.0 + trail_params(&t).0) {
+                            "trailing_stop_loss"
+                        } else {
+                            "stop_loss"
+                        },
+                    )
+                    .await?;
+                }
+                Ok(())
             }
-            if t.market == "futures" && self.sync_external_exit(&c, &t, &ex).await? {
-                return Ok(());
-            }
-            let price = ex.price(&t.market, &t.pair).await?;
-            let (peak, stop) = stop_price(&t, price);
-            if t.market == "futures" && stop != t.stop_loss_abs {
-                let ins = ex.instrument(&t.market, &t.pair).await?;
-                let tick = ins["priceFilter"]["tickSize"]
-                    .as_str()
-                    .context("缺少价格精度")?;
-                ex.post("/v5/position/trading-stop",json!({"category":"linear","symbol":symbol(&t.pair),"tpslMode":"Full","positionIdx":0,"stopLoss":quantize(stop,tick)?,"slTriggerBy":"LastPrice"})).await?;
-            }
-            t.peak = peak;
-            t.stop_loss_abs = stop;
-            self.store.update_trade(&t)?;
-            if t.market == "spot" && price <= stop {
-                self.close_position(
-                    t.trade_id,
-                    if peak >= t.open_rate * (1.0 + trail_params(&t).0) {
-                        "trailing_stop_loss"
-                    } else {
-                        "stop_loss"
-                    },
-                )
-                .await?;
-            }
-            Ok(())
-            }.await;
+            .await;
             if let Err(e) = result {
                 risk_errors.push(e.to_string());
             }
@@ -775,6 +804,11 @@ mod tests {
         assert_eq!(trade_leverage(25, 0.05), 12);
         assert_eq!(trade_leverage(3, 0.05), 3);
         assert_eq!(trade_leverage(25, 0.10), 6);
+        // A 2% stop wants 25×, but a 12.5× symbol caps it at 12 instead of refusing the entry.
+        assert_eq!(trade_leverage(leverage_cap(25, 12.5), 0.02), 12);
+        assert_eq!(leverage_cap(10, 100.0), 10);
+        assert_eq!(leverage_cap(10, 0.0), 1);
+        assert_eq!(leverage_cap(10, f64::NAN), 1);
     }
 
     #[test]

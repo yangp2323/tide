@@ -121,6 +121,14 @@ impl Store {
         )?;
         Ok(())
     }
+    /// Whether this order link was submitted by the bot (in any state).
+    pub fn has_order(&self, link: &str) -> Result<bool> {
+        Ok(self.db.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM orders WHERE link=?)",
+            [link],
+            |r| r.get(0),
+        )?)
+    }
     pub fn unresolved(&self) -> Result<Vec<Value>> {
         let db = self.db.lock().unwrap();
         let mut q = db.prepare("SELECT link,action,pair,data FROM orders WHERE state='pending'")?;
