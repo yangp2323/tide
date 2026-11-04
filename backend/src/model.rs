@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+/// Hard limits the AI cannot exceed. Direction, how many positions to hold and how much to
+/// risk on each are the AI's decisions inside them.
+pub const MAX_OPEN: usize = 5;
+pub const MAX_RISK_PER_TRADE_PCT: f64 = 2.0;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -25,12 +30,12 @@ impl Default for Config {
         Self {
             market: "spot".into(),
             pairs: vec!["BTC/USDT".into(), "ETH/USDT".into(), "SOL/USDT".into()],
-            max_open: 3,
+            max_open: MAX_OPEN,
             leverage: 1,
             short: false,
             capital: None,
-            risk_per_trade_pct: 1.0,
-            max_same_direction: 2,
+            risk_per_trade_pct: MAX_RISK_PER_TRADE_PCT,
+            max_same_direction: 0,
             running: false,
             ai: AiConfig::default(),
             exchange: Credentials::default(),

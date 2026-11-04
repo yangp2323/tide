@@ -7,7 +7,7 @@ import { useOv } from "@/lib/store";
 import { Card, Empty, MsgBox, Skeleton, useAction } from "@/lib/ui";
 
 type Market = "spot" | "futures";
-type Draft = { market: Market; leverage: number; short: boolean; max_open: number; risk_per_trade_pct: number; max_same_direction: number; pairs: string[] };
+type Draft = { market: Market; leverage: number; pairs: string[] };
 type Row = {
   pair: string;
   base: string;
@@ -35,13 +35,9 @@ export default function StrategyPage() {
     () => ({
       market: d.market === "futures" ? "futures" : "spot",
       leverage: d.leverage ?? 1,
-      short: !!d.short,
-      max_open: d.max_open ?? 3,
-      risk_per_trade_pct: d.risk_per_trade_pct ?? 1,
-      max_same_direction: d.max_same_direction ?? 2,
       pairs: d.pairs ?? [],
     }),
-    [d.market, d.leverage, d.short, d.max_open, d.risk_per_trade_pct, d.max_same_direction, d.pairs],
+    [d.market, d.leverage, d.pairs],
   );
 
   const savedRef = useRef(saved);
@@ -50,8 +46,9 @@ export default function StrategyPage() {
   const cur = draft ?? saved;
   const fut = cur.market === "futures";
   const maxPairs = d.max_pairs ?? 12;
-  const maxOpen = d.max_open_limit ?? 5;
   const maxLev = d.max_leverage ?? 25;
+  const openCap = d.max_open_limit ?? 5;
+  const riskCap = d.risk_per_trade_pct ?? 2;
   // 止损由 AI 给出（默认参考 2.5×ATR），限制在 2%–10%；系统按止损距离逐笔下调杠杆，使止损不超过强平距离的 60%。
   const stopLo = 0.02;
   const stopHi = 0.1;
@@ -96,15 +93,9 @@ export default function StrategyPage() {
       const next: Draft = { ...from, ...ch };
       if (ch.market && ch.market !== from.market) {
         next.pairs = from.pairs.map(ch.market === "futures" ? toFutures : toSpot);
-        if (ch.market === "spot") {
-          next.leverage = 1;
-          next.short = false;
-        }
+        if (ch.market === "spot") next.leverage = 1;
       }
-      next.max_open = clamp(next.max_open || 1, 1, maxOpen);
       next.leverage = clamp(next.leverage || 1, 1, maxLev);
-      next.risk_per_trade_pct = clamp(Math.round((next.risk_per_trade_pct || 1) * 10) / 10, 0.1, 5);
-      next.max_same_direction = clamp(Math.round(next.max_same_direction ?? 2), 0, 5);
       return next;
     });
   }
@@ -120,10 +111,6 @@ export default function StrategyPage() {
     const out: string[] = [];
     if (a.market !== b.market) out.push(b.market === "futures" ? "改成合约" : "改成现货");
     if (a.leverage !== b.leverage && b.market === "futures") out.push(`杠杆 ${a.leverage}× → ${b.leverage}×`);
-    if (a.short !== b.short && b.market === "futures") out.push(b.short ? "开启做空" : "关闭做空");
-    if (a.max_open !== b.max_open) out.push(`持仓 ${a.max_open} → ${b.max_open} 笔`);
-    if (a.risk_per_trade_pct !== b.risk_per_trade_pct) out.push(`每笔风险 ${a.risk_per_trade_pct}% → ${b.risk_per_trade_pct}%`);
-    if (a.max_same_direction !== b.max_same_direction) out.push(`同方向持仓上限 ${a.max_same_direction || "不限"} → ${b.max_same_direction || "不限"}`);
     if (a.market === b.market) {
       const sa = new Set(a.pairs);
       const sb = new Set(b.pairs);
@@ -149,10 +136,10 @@ export default function StrategyPage() {
 
   async function save() {
     const ch = changes();
-    if ((fut && cur.leverage >= 5) || cur.risk_per_trade_pct > 2) {
+    if (fut && cur.leverage >= 5) {
       const ok = await confirm({
-        title: cur.risk_per_trade_pct > 2 ? `确定每笔承担 ${cur.risk_per_trade_pct}% 风险？` : `确定用最高 ${cur.leverage} 倍杠杆？`,
-        body: `每次止损最多约亏总资金的 ${cur.risk_per_trade_pct}%（不含费用和滑点，AI 可以选更小），${cur.max_open} 笔同时止损最多约亏 ${(cur.risk_per_trade_pct * cur.max_open).toFixed(1)}%。杠杆只影响占用的保证金，AI 在上限内选择，系统还会按止损距离下调，保证止损先于强平。`,
+        title: `确定用最高 ${cur.leverage} 倍杠杆？`,
+        body: `AI 在这个上限内选择杠杆，每笔最多亏总资金的 ${riskCap}%、同时最多 ${openCap} 笔（不含费用和滑点）。杠杆只影响占用的保证金，系统还会按止损距离下调，保证止损先于强平。`,
         ok: "确定",
         danger: true,
       });
@@ -189,8 +176,6 @@ export default function StrategyPage() {
   if (!query && rows0) list = [...rows0.filter((m) => sel.has(m.pair) && !list.includes(m)), ...list];
 
   const warn: string[] = [];
-  if (cur.risk_per_trade_pct * cur.max_open > 6)
-    warn.push(`${cur.max_open} 笔同时止损最多约亏总资金的 ${(cur.risk_per_trade_pct * cur.max_open).toFixed(1)}%，超过一般建议的 6%。`);
   if (fut && cur.leverage >= 5)
     warn.push(`跳空或滑点可能让止损成交价比触发价更差；杠杆越高，留给止损的空间越小。`);
   const ch = changes();
@@ -256,70 +241,20 @@ export default function StrategyPage() {
 
           <div className="field">
             <b>方向和仓位</b>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={cur.short}
-                disabled={!fut}
-                onChange={(e) => update({ short: e.target.checked })}
-              />
-              <span>允许做空（跌势里开空单）</span>
-            </label>
-            <p>{fut ? "允许 AI 在判断下跌趋势有正预期收益时开空单。" : "现货不能做空，切到合约才能开。"}</p>
-            <div style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-              <span className="muted" style={{ fontSize: 13 }}>
-                同时最多持有
-              </span>
-              <span className="stepper">
-                <button aria-label="减少" onClick={() => update({ max_open: cur.max_open - 1 })}>
-                  −
-                </button>
-                <output>{cur.max_open}</output>
-                <button aria-label="增加" onClick={() => update({ max_open: cur.max_open + 1 })}>
-                  +
-                </button>
-              </span>
-              <span className="muted" style={{ fontSize: 13 }}>
-                笔
-              </span>
+            <p>
+              {fut ? "做多还是做空、同时持有几笔、每笔冒多大风险，都由 AI 根据行情和账户情况决定，没有开关。" : "现货只能做多。同时持有几笔、每笔冒多大风险，由 AI 根据行情和账户情况决定，没有开关。"}
+            </p>
+            <div className="risk" style={{ marginTop: 12 }}>
+              <div>
+                <span>同时最多持有（系统上限）</span>
+                <b>{openCap} 笔</b>
+              </div>
+              <div>
+                <span>每笔最多亏（系统上限）</span>
+                <b>{riskCap}% 总资金</b>
+              </div>
             </div>
-            <p>这是持仓数量上限，不要求开满。每笔保证金不超过预留 5% 后按剩余名额平分的资金。</p>
-            <div style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-              <span className="muted" style={{ fontSize: 13 }}>
-                每笔最多亏
-              </span>
-              <span className="stepper">
-                <button aria-label="减少" onClick={() => update({ risk_per_trade_pct: cur.risk_per_trade_pct - (cur.risk_per_trade_pct > 1 ? 0.5 : 0.1) })}>
-                  −
-                </button>
-                <output>{cur.risk_per_trade_pct}%</output>
-                <button aria-label="增加" onClick={() => update({ risk_per_trade_pct: cur.risk_per_trade_pct + (cur.risk_per_trade_pct >= 1 ? 0.5 : 0.1) })}>
-                  +
-                </button>
-              </span>
-              <span className="muted" style={{ fontSize: 13 }}>
-                总资金
-              </span>
-            </div>
-            <p>这是上限：AI 每次开仓自己决定实际风险（不超过这里）和杠杆（不超过上面的最高杠杆），系统按「风险 ÷ 止损距离」算出仓位，止损越宽仓位越小。资金太少、按这个上限算出的仓位达不到交易所最低下单额时不会开仓，快照里会告诉 AI 每个币的最小下单额。</p>
-            <div style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-              <span className="muted" style={{ fontSize: 13 }}>
-                同方向最多
-              </span>
-              <span className="stepper">
-                <button aria-label="减少" onClick={() => update({ max_same_direction: cur.max_same_direction - 1 })}>
-                  −
-                </button>
-                <output>{cur.max_same_direction || "不限"}</output>
-                <button aria-label="增加" onClick={() => update({ max_same_direction: cur.max_same_direction + 1 })}>
-                  +
-                </button>
-              </span>
-              <span className="muted" style={{ fontSize: 13 }}>
-                笔
-              </span>
-            </div>
-            <p>BTC、ETH 等币种走势高度相关，同向的几笔仓位其实接近一笔大仓位。限制同方向数量可以避免风险集中；0 表示不限。</p>
+            <p>AI 看到每个币的最小下单额，资金不够的币不会提出开仓。当日亏损、回撤和连续亏损这些账户级保护在「AI 交易」页设置，触发后会停止开仓。</p>
           </div>
         </div>
         {warn.length > 0 && (

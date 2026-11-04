@@ -632,6 +632,7 @@ async fn futures_stops_follow_ai_trail_and_external_take_profit() {
         pairs: vec!["BTC/USDT:USDT".into()],
         leverage: 5,
         short: true,
+        risk_per_trade_pct: 1.0,
         ..model::Config::default()
     };
     let (app, dir, server) = sim_app(&sim, cfg).await;
@@ -723,6 +724,7 @@ async fn ai_chooses_risk_and_leverage_within_the_limits() {
         pairs: vec!["BTC/USDT:USDT".into()],
         leverage: 5,
         short: true,
+        risk_per_trade_pct: 1.0,
         ..model::Config::default()
     };
     let (app, dir, server) = sim_app(&sim, cfg).await;
@@ -921,4 +923,30 @@ fn legacy_ai_config_becomes_one_channel() {
     a.active_channel = "gone".into();
     a.normalize();
     assert_eq!(a.active_channel, "default");
+}
+
+#[test]
+fn existing_config_moves_to_ai_managed_limits_once() {
+    let dir = std::env::temp_dir().join(format!("tide-limits-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        json!({"market":"futures","max_open":3,"risk_per_trade_pct":1.0,"max_same_direction":2,"short":false,"leverage":10}).to_string(),
+    )
+    .unwrap();
+    let store = store::Store::open(&dir).unwrap();
+    let c = store.config().unwrap();
+    assert_eq!(c.max_open, model::MAX_OPEN);
+    assert_eq!(c.risk_per_trade_pct, model::MAX_RISK_PER_TRADE_PCT);
+    assert_eq!(c.max_same_direction, 0);
+    assert!(c.short);
+    assert_eq!(c.leverage, 10);
+    // The limits are applied once; later changes made in code or by hand are left alone.
+    let mut c = c;
+    c.max_open = 2;
+    store.save_config(&c).unwrap();
+    drop(store);
+    let store = store::Store::open(&dir).unwrap();
+    assert_eq!(store.config().unwrap().max_open, 2);
+    std::fs::remove_dir_all(dir).unwrap();
 }

@@ -22,10 +22,28 @@ impl Store {
           CREATE TABLE IF NOT EXISTS decisions(id INTEGER PRIMARY KEY, data TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
         migrate_schema(&db)?;
-        Ok(Self {
+        let store = Self {
             dir: dir.into(),
             db: Mutex::new(db),
-        })
+        };
+        store.apply_ai_limits()?;
+        Ok(store)
+    }
+    /// Once: an existing configuration moves to the AI-managed limits, because those settings
+    /// are no longer editable and would otherwise keep their old manual values.
+    fn apply_ai_limits(&self) -> Result<()> {
+        if self.state("ai_limits_v1")?.is_none() {
+            if self.dir.join("config.json").exists() {
+                let mut c = self.config()?;
+                c.max_open = crate::model::MAX_OPEN;
+                c.risk_per_trade_pct = crate::model::MAX_RISK_PER_TRADE_PCT;
+                c.max_same_direction = 0;
+                c.short = c.market == "futures";
+                self.save_config(&c)?;
+            }
+            self.set_state("ai_limits_v1", "1")?;
+        }
+        Ok(())
     }
     pub fn config(&self) -> Result<Config> {
         let path = self.dir.join("config.json");

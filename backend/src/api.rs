@@ -294,19 +294,17 @@ async fn handle(
                 .collect();
             new.pairs.sort();
             new.pairs.dedup();
-            new.max_open = body["max_open"].as_u64().context("持仓数无效")? as usize;
+            // Direction, position count and per-trade risk are the AI's decisions; the
+            // system only keeps its hard limits.
+            new.max_open = crate::model::MAX_OPEN;
+            new.risk_per_trade_pct = crate::model::MAX_RISK_PER_TRADE_PCT;
+            new.max_same_direction = 0;
             new.leverage = if new.market == "spot" {
                 1
             } else {
                 body["leverage"].as_u64().context("杠杆无效")? as u32
             };
-            new.short = new.market == "futures" && body["short"].as_bool().unwrap_or(false);
-            if let Some(r) = body.get("risk_per_trade_pct").filter(|v| !v.is_null()) {
-                new.risk_per_trade_pct = r.as_f64().context("每笔风险无效")?;
-            }
-            if let Some(m) = body.get("max_same_direction").filter(|v| !v.is_null()) {
-                new.max_same_direction = m.as_u64().context("同方向持仓上限无效")? as usize;
-            }
+            new.short = new.market == "futures";
             validate(&new)?;
             ensure!(
                 app.store.unresolved()?.is_empty(),
