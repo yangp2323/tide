@@ -1087,6 +1087,71 @@ async fn spot_stop_rests_on_the_exchange_and_is_cancelled_before_a_sale() {
 }
 
 #[test]
+fn old_decisions_and_events_are_pruned_but_trades_and_recent_records_stay() {
+    let dir = std::env::temp_dir().join(format!("tide-prune-{}", uuid::Uuid::new_v4()));
+    let store = store::Store::open(&dir).unwrap();
+    store
+        .decision(&json!({"time":"2000-01-01 00:00:00","source":"auto","actions":[]}))
+        .unwrap();
+    store
+        .decision(&json!({"time":model::now(),"source":"auto","actions":[]}))
+        .unwrap();
+    store.log("INFO", "recent");
+    drop(store);
+    let db = rusqlite::Connection::open(dir.join("tide.sqlite")).unwrap();
+    db.execute(
+        "INSERT INTO events(time,level,message) VALUES ('2000-01-01 00:00:00','INFO','old')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    // Records past their retention go when the store opens.
+    let store = store::Store::open(&dir).unwrap();
+    let decisions = store.decisions(10).unwrap();
+    assert_eq!(decisions.len(), 1);
+    assert_ne!(decisions[0]["time"], "2000-01-01 00:00:00");
+    let logs = store.logs(10).unwrap()["logs"].to_string();
+    assert!(logs.contains("recent") && !logs.contains("old"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn pairs_are_fetched_together_and_keep_their_order() {
+    let _env = EXCHANGE.lock().await;
+    let sim = Arc::new(Mutex::new(Sim {
+        futures: true,
+        price: 10.0,
+        ..Sim::default()
+    }));
+    let cfg = model::Config {
+        market: "futures".into(),
+        pairs: vec![
+            "ETH/USDT:USDT".into(),
+            "BTC/USDT:USDT".into(),
+            "SOL/USDT:USDT".into(),
+        ],
+        leverage: 5,
+        ..model::Config::default()
+    };
+    let (app, dir, server) = sim_app(&sim, cfg).await;
+    let snap = app.snapshot().await.unwrap();
+    let names: Vec<_> = snap["pairs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["pair"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["ETH/USDT:USDT", "BTC/USDT:USDT", "SOL/USDT:USDT"]);
+    assert!(snap["pairs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|p| p["market_stats"]["last_price"] == 10.0));
+    server.abort();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn schema_is_versioned_and_open_trades_are_filtered_in_sql() {
     let dir = std::env::temp_dir().join(format!("tide-schema-{}", uuid::Uuid::new_v4()));
     let store = store::Store::open(&dir).unwrap();

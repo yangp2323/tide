@@ -11,6 +11,25 @@ pub struct Store {
     pub dir: PathBuf,
     db: Mutex<Connection>,
 }
+/// How long the AI's decision records and the event log are kept. Trades, orders and
+/// the knowledge base are never removed.
+const KEEP_DECISIONS_DAYS: i64 = 90;
+const KEEP_EVENTS_DAYS: i64 = 30;
+fn prune(db: &Connection) {
+    let before = |days: i64| {
+        (chrono::Utc::now() - chrono::Duration::days(days))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    };
+    let _ = db.execute(
+        "DELETE FROM decisions WHERE json_extract(data,'$.time') < ?1",
+        [before(KEEP_DECISIONS_DAYS)],
+    );
+    let _ = db.execute(
+        "DELETE FROM events WHERE time < ?1",
+        [before(KEEP_EVENTS_DAYS)],
+    );
+}
 impl Store {
     pub fn open(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
@@ -28,6 +47,7 @@ impl Store {
         };
         store.apply_ai_limits()?;
         store.seed_knowledge()?;
+        prune(&store.db.lock().unwrap());
         Ok(store)
     }
     /// Once: the starter notes. Deleting them later is respected.
@@ -271,6 +291,9 @@ impl Store {
                 "INSERT INTO events(time,level,message) VALUES (?,?,?)",
                 params![now(), level, message],
             );
+            if db.last_insert_rowid() % 1000 == 0 {
+                prune(&db);
+            }
         }
     }
     pub fn logs(&self, limit: usize) -> Result<Value> {
@@ -291,10 +314,11 @@ impl Store {
         Ok(json!({"logs":rows}))
     }
     pub fn decision(&self, v: &Value) -> Result<()> {
-        self.db
-            .lock()
-            .unwrap()
-            .execute("INSERT INTO decisions(data) VALUES (?)", [v.to_string()])?;
+        let db = self.db.lock().unwrap();
+        db.execute("INSERT INTO decisions(data) VALUES (?)", [v.to_string()])?;
+        if db.last_insert_rowid() % 100 == 0 {
+            prune(&db);
+        }
         Ok(())
     }
     pub fn decisions(&self, limit: usize) -> Result<Vec<Value>> {
