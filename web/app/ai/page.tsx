@@ -20,6 +20,11 @@ function DecisionRow({ r }: { r: any }) {
         </span>
         <span>{r.channel ? `${r.channel} · ` : ""}{r.model}</span>
         {r.seconds ? <span>{r.seconds}s</span> : null}
+        {r.usage?.cache_read_input_tokens || r.usage?.cache_creation_input_tokens ? (
+          <span title="Claude 提示词缓存：命中的部分按约 1/10 价格计费，写入的部分是 1.25 到 2 倍">
+            缓存命中 {r.usage.cache_read_input_tokens || 0} · 写入 {r.usage.cache_creation_input_tokens || 0} · 未缓存 {r.usage.input_tokens || 0}
+          </span>
+        ) : null}
       </div>
       {r.error ? <div className="msg err">{r.error}</div> : null}
       {r.trigger?.events?.length ? (

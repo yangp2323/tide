@@ -465,10 +465,13 @@ fn opt_num(a: &Value, key: &str) -> Result<Option<f64>> {
 pub struct Prompt {
     pub system: &'static str,
     pub instruction: &'static str,
+    /// Whether the slow-changing part of the snapshot is worth keeping in Claude's prompt cache.
+    pub cache: bool,
 }
 const TRADING: Prompt = Prompt {
     system: SYSTEM,
     instruction: "Return only a valid JSON object with analysis, memory and actions.",
+    cache: true,
 };
 async fn call_model(c: &Config, snap: &Value) -> Result<(String, Value)> {
     call_model_for(c, snap, &TRADING).await
@@ -723,12 +726,50 @@ pub fn validate_model_options(ai: &AiConfig) -> Result<()> {
 fn model_request(ai: &AiConfig, snap: &Value) -> Result<(String, Value)> {
     model_request_for(ai, snap, &TRADING)
 }
+/// Moves what only changes when a new candle closes or a note is edited (the knowledge notes
+/// and each pair's candle history) in front of everything that changes every run. Both parts
+/// serialize with sorted keys, so the stable text is byte-identical between runs.
+fn split_for_cache(snap: &Value) -> Option<(Value, Value)> {
+    let mut live = snap.as_object()?.clone();
+    let knowledge = live.remove("knowledge")?;
+    let mut history = vec![];
+    if let Some(pairs) = live.get_mut("pairs").and_then(Value::as_array_mut) {
+        for p in pairs {
+            let Some(p) = p.as_object_mut() else { continue };
+            let mut h = serde_json::Map::new();
+            h.insert("pair".into(), p.get("pair").cloned().unwrap_or(Value::Null));
+            for k in ["columns", "candles", "daily_columns", "daily"] {
+                if let Some(v) = p.remove(k) {
+                    h.insert(k.into(), v);
+                }
+            }
+            history.push(Value::Object(h));
+        }
+    }
+    Some((
+        json!({"knowledge":knowledge,"candle_history":history}),
+        Value::Object(live),
+    ))
+}
 fn model_request_for(ai: &AiConfig, snap: &Value, prompt: &Prompt) -> Result<(String, Value)> {
     validate_model_options(ai)?;
     // Some Responses gateways check the input independently of system instructions
     // before accepting JSON mode, so the requirement belongs in both places.
     let user = format!("{}\nSnapshot:\n{}", prompt.instruction, snap);
     if ai.provider == "anthropic" {
+        let content = match prompt.cache.then(|| split_for_cache(snap)).flatten() {
+            Some((stable, live)) => {
+                // Claude caches by exact prefix, so everything that is the same from run to run
+                // goes first and the breakpoint sits right after it. Runs further apart than the
+                // 5-minute lifetime need the 1-hour one for the next run to find the entry.
+                let ttl = if ai.interval < 5 { "5m" } else { "1h" };
+                json!([
+                    {"type":"text","text":format!("Stable context (changes rarely; part of the snapshot):\n{}", stable),"cache_control":{"type":"ephemeral","ttl":ttl}},
+                    {"type":"text","text":format!("{}\nSnapshot (the rest, current for this run; read together with the stable context):\n{}", prompt.instruction, live)}
+                ])
+            }
+            None => json!(user),
+        };
         let base = if ai.base_url.is_empty() {
             "https://api.anthropic.com"
         } else {
@@ -742,7 +783,7 @@ fn model_request_for(ai: &AiConfig, snap: &Value, prompt: &Prompt) -> Result<(St
             format!("{}/v1/messages", base)
         };
         let max_tokens = if ai.stream { 64000 } else { 32000 };
-        let mut body = json!({"model":ai.model,"stream":ai.stream,"max_tokens":max_tokens,"system":prompt.system,"messages":[{"role":"user","content":user}]});
+        let mut body = json!({"model":ai.model,"stream":ai.stream,"max_tokens":max_tokens,"system":prompt.system,"messages":[{"role":"user","content":content}]});
         match ai.claude_thinking.as_str() {
             "adaptive" => body["thinking"] = json!({"type":"adaptive"}),
             "enabled" => {
@@ -964,6 +1005,58 @@ mod model_tests {
         assert!(body.get("thinking").is_none());
         assert!(body.get("output_config").is_none());
         assert_eq!(old.claude_thinking_budget, 4096);
+    }
+
+    #[test]
+    fn claude_requests_keep_the_unchanging_part_first_and_cached() {
+        let mut ai: AiConfig = serde_json::from_value(json!({"provider":"anthropic"})).unwrap();
+        ai.interval = 10;
+        let snap = |equity: f64, price: f64| {
+            json!({"time_utc":"now","account":{"equity_usdt":equity},"knowledge":[{"title":"a","body":"b"}],
+                "pairs":[{"pair":"BTC/USDT","sizing":{"min_order_usdt":5},"market_stats":{"price":price},
+                    "columns":["date"],"candles":[["2026-01-01",1]],"daily_columns":["date"],"daily":{"candles":[["2026-01-01",1]]}}]})
+        };
+        let (_, a) = model_request(&ai, &snap(100.0, 1.0)).unwrap();
+        let (_, b) = model_request(&ai, &snap(250.0, 2.0)).unwrap();
+        let blocks = a["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(
+            blocks[0]["cache_control"],
+            json!({"type":"ephemeral","ttl":"1h"})
+        );
+        assert!(blocks[1].get("cache_control").is_none());
+        let (stable, live) = (
+            blocks[0]["text"].as_str().unwrap(),
+            blocks[1]["text"].as_str().unwrap(),
+        );
+        assert!(stable.contains("knowledge") && stable.contains("2026-01-01"));
+        assert!(
+            live.contains("equity_usdt")
+                && live.contains("min_order_usdt")
+                && !live.contains("2026-01-01")
+        );
+        // Whatever changes between runs must not touch the cached text.
+        assert_eq!(
+            stable,
+            b["messages"][0]["content"][0]["text"].as_str().unwrap()
+        );
+        assert_ne!(
+            live,
+            b["messages"][0]["content"][1]["text"].as_str().unwrap()
+        );
+        // Runs closer together than the 5-minute lifetime keep the default one.
+        ai.interval = 2;
+        let (_, c) = model_request(&ai, &snap(1.0, 1.0)).unwrap();
+        assert_eq!(
+            c["messages"][0]["content"][0]["cache_control"],
+            json!({"type":"ephemeral","ttl":"5m"})
+        );
+        // Other providers and snapshots without a stable part are sent as before.
+        let (_, d) = model_request(&ai, &json!({})).unwrap();
+        assert!(d["messages"][0]["content"].is_string());
+        let openai: AiConfig = serde_json::from_value(json!({"provider":"openai"})).unwrap();
+        let (_, e) = model_request(&openai, &snap(1.0, 1.0)).unwrap();
+        assert!(!e.to_string().contains("cache_control"));
     }
 
     #[test]

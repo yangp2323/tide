@@ -19,6 +19,7 @@ Return only a JSON object {"summary":"简体中文复盘总结，说明样本量
 pub const REVIEW: Prompt = Prompt {
     system: SYSTEM,
     instruction: "Return only a valid JSON object with summary and changes.",
+    cache: false,
 };
 
 fn hold_minutes(t: &Trade) -> Option<f64> {
