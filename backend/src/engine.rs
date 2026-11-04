@@ -85,41 +85,55 @@ pub fn leverage_cap(configured: u32, symbol_max: f64) -> u32 {
 pub fn risk_stake(equity: f64, risk_pct: f64, stop: f64, leverage: u32) -> f64 {
     equity * risk_pct / 100.0 / stop / leverage as f64
 }
-/// Trailing starts once the price moved one stop distance in favor, then trails by half of it.
-/// Trades opened before ATR stops keep the former fixed 6% / 3% rule.
-pub fn trail_params(t: &Trade) -> (f64, f64) {
-    if t.stop_dist > 0.0 {
-        (t.stop_dist, t.stop_dist / 2.0)
-    } else {
-        (0.06, 0.03)
+/// Stop-loss and take-profit the AI asks for when opening, as percentages of the entry price.
+#[derive(Clone, Copy, Default)]
+pub struct Stops {
+    pub stop_pct: Option<f64>,
+    pub take_profit_pct: Option<f64>,
+}
+/// An AI-chosen stop distance is kept between 2% and 10% so leverage can still keep it ahead of liquidation.
+pub fn requested_stop(pct: f64) -> Result<f64> {
+    ensure!(pct.is_finite() && pct > 0.0, "止损百分比无效");
+    Ok((pct / 100.0).clamp(0.02, 0.10))
+}
+pub fn take_profit_from_pct(price: f64, pct: f64, short: bool) -> Result<f64> {
+    ensure!(
+        pct.is_finite() && pct > 0.0 && (!short || pct < 100.0),
+        "止盈百分比无效"
+    );
+    Ok(price
+        * if short {
+            1.0 - pct / 100.0
+        } else {
+            1.0 + pct / 100.0
+        })
+}
+/// Validate an AI stop update against the current price. The stop may only tighten; a take
+/// profit of 0 removes it.
+pub fn check_new_stops(t: &Trade, price: f64, stop: Option<f64>, tp: Option<f64>) -> Result<()> {
+    ensure!(stop.is_some() || tp.is_some(), "缺少止损或止盈价格");
+    if let Some(s) = stop {
+        ensure!(s.is_finite() && s > 0.0, "止损价格无效");
+        if t.is_short {
+            ensure!(s > price, "空单止损价必须高于当前价");
+            ensure!(s <= t.stop_loss_abs, "止损只能向有利方向移动");
+        } else {
+            ensure!(s < price, "多单止损价必须低于当前价");
+            ensure!(s >= t.stop_loss_abs, "止损只能向有利方向移动");
+        }
     }
+    if let Some(p) = tp.filter(|p| *p != 0.0) {
+        ensure!(p.is_finite() && p > 0.0, "止盈价格无效");
+        ensure!(
+            if t.is_short { p < price } else { p > price },
+            "止盈价必须在当前价的盈利一侧"
+        );
+    }
+    Ok(())
 }
 /// Today's PnL for the daily loss limit: realized today plus every open position's floating loss.
 pub fn daily_pnl(realized_today: f64, unrealized: &[f64]) -> f64 {
     realized_today + unrealized.iter().map(|u| u.min(0.0)).sum::<f64>()
-}
-pub fn stop_price(t: &Trade, price: f64) -> (f64, f64) {
-    let (activate, trail) = trail_params(t);
-    let peak = if t.is_short {
-        t.peak.min(price)
-    } else {
-        t.peak.max(price)
-    };
-    let favorable = if t.is_short {
-        (t.open_rate - peak) / t.open_rate
-    } else {
-        (peak - t.open_rate) / t.open_rate
-    };
-    let stop = if favorable >= activate {
-        if t.is_short {
-            t.stop_loss_abs.min(peak * (1.0 + trail))
-        } else {
-            t.stop_loss_abs.max(peak * (1.0 - trail))
-        }
-    } else {
-        t.stop_loss_abs
-    };
-    (peak, stop)
 }
 pub fn realized(trades: &[Trade], today_only: bool) -> f64 {
     trades
@@ -159,6 +173,9 @@ impl App {
         }
         let mut t: Trade = serde_json::from_value(order["data"]["trade"].clone())?;
         if order["action"] == "entry" {
+            if t.take_profit_abs > 0.0 && t.open_rate > 0.0 {
+                t.take_profit_abs *= fill.price / t.open_rate;
+            }
             t.open_rate = fill.price;
             t.amount = fill.qty
                 - if t.market == "spot" {
@@ -344,6 +361,7 @@ impl App {
         short: bool,
         tag: &str,
         confidence: Option<f64>,
+        stops: Stops,
     ) -> Result<()> {
         // Caller must hold gate from fresh risk checks through durable reservation and submission.
         let c = self.store.config()?;
@@ -373,12 +391,22 @@ impl App {
             free
         };
         let futures = c.market == "futures";
-        let candles = ex.candles(&c.market, pair, 240, 300, None).await?;
-        ensure!(candles.len() >= 30, "{} K 线不足，无法计算 ATR 止损", pair);
-        let atr = indicators::calculate(&candles)
-            .last()
-            .map_or(0.0, |x| x.atr);
-        let stop = stop_distance(atr, price).context("ATR 无效，无法计算止损")?;
+        let stop = match stops.stop_pct {
+            Some(pct) => requested_stop(pct)?,
+            None => {
+                let candles = ex.candles(&c.market, pair, 240, 300, None).await?;
+                ensure!(candles.len() >= 30, "{} K 线不足，无法计算 ATR 止损", pair);
+                let atr = indicators::calculate(&candles)
+                    .last()
+                    .map_or(0.0, |x| x.atr);
+                stop_distance(atr, price).context("ATR 无效，无法计算止损")?
+            }
+        };
+        let take_profit = stops
+            .take_profit_pct
+            .map(|pct| take_profit_from_pct(price, pct, short))
+            .transpose()?
+            .unwrap_or(0.0);
         let leverage = if futures {
             trade_leverage(
                 leverage_cap(c.leverage, num(&ins["leverageFilter"]["maxLeverage"])),
@@ -482,6 +510,7 @@ impl App {
             profit_abs: 0.0,
             profit_ratio: 0.0,
             stop_loss_abs: price * if short { 1.0 + stop } else { 1.0 - stop },
+            take_profit_abs: take_profit,
             peak: price,
             enter_tag: tag.into(),
             exit_reason: None,
@@ -499,6 +528,11 @@ impl App {
             body["slTriggerBy"] = json!("LastPrice");
             body["tpslMode"] = json!("Full");
             body["slOrderType"] = json!("Market");
+            if take_profit > 0.0 {
+                body["takeProfit"] = json!(quantize(take_profit, tick)?);
+                body["tpTriggerBy"] = json!("LastPrice");
+                body["tpOrderType"] = json!("Market");
+            }
         } else {
             body["marketUnit"] = json!("baseCoin");
             body["isLeverage"] = json!(0);
@@ -574,13 +608,63 @@ impl App {
             .await;
         Ok(())
     }
-    /// Move the exchange-hosted stop. Bybit answers 34040 when the rounded price equals the
-    /// current stop; that is already the wanted state, not a failure.
-    async fn set_stop(&self, ex: &Bybit, t: &Trade, price: &str) -> Result<()> {
-        match ex.post("/v5/position/trading-stop",json!({"category":"linear","symbol":symbol(&t.pair),"tpslMode":"Full","positionIdx":0,"stopLoss":price,"slTriggerBy":"LastPrice"})).await {
+    /// Push the exchange-hosted stop and take profit ("0" removes the latter). Bybit answers
+    /// 34040 when nothing changed; that is already the wanted state, not a failure.
+    async fn set_stop(&self, ex: &Bybit, t: &Trade, stop: &str, take_profit: &str) -> Result<()> {
+        match ex.post("/v5/position/trading-stop",json!({"category":"linear","symbol":symbol(&t.pair),"tpslMode":"Full","positionIdx":0,"stopLoss":stop,"slTriggerBy":"LastPrice","takeProfit":take_profit,"tpTriggerBy":"LastPrice"})).await {
             Err(e) if !e.downcast_ref::<crate::exchange::Rejected>().is_some_and(|r| r.1 == 34040) => Err(e),
             _ => Ok(()),
         }
+    }
+    /// AI-requested change of an open position's stop (tighten only) and take profit.
+    pub async fn set_stops(&self, id: i64, stop: Option<f64>, tp: Option<f64>) -> Result<()> {
+        let c = self.store.config()?;
+        self.reconcile(&c).await?;
+        let mut t = self
+            .store
+            .open_trades()?
+            .into_iter()
+            .find(|t| t.trade_id == id)
+            .context("持仓不存在或已平仓")?;
+        ensure!(
+            !self.store.unresolved()?.iter().any(|o| o["pair"] == t.pair),
+            "该交易对有待确认订单"
+        );
+        let ex = self.exchange(&c);
+        let price = ex.price(&t.market, &t.pair).await?;
+        check_new_stops(&t, price, stop, tp)?;
+        if let Some(s) = stop {
+            t.stop_loss_abs = s;
+        }
+        if let Some(p) = tp {
+            t.take_profit_abs = p.max(0.0);
+        }
+        // Persist first: if the exchange update fails, sync_external_exit restores it.
+        self.store.update_trade(&t)?;
+        if t.market == "futures" {
+            self.push_stops(&ex, &t).await?;
+        }
+        self.store.log(
+            "INFO",
+            &format!(
+                "{} 止损 {} 止盈 {}",
+                t.pair, t.stop_loss_abs, t.take_profit_abs
+            ),
+        );
+        Ok(())
+    }
+    async fn push_stops(&self, ex: &Bybit, t: &Trade) -> Result<()> {
+        let ins = ex.instrument(&t.market, &t.pair).await?;
+        let tick = ins["priceFilter"]["tickSize"]
+            .as_str()
+            .context("缺少价格精度")?;
+        let tp = if t.take_profit_abs > 0.0 {
+            quantize(t.take_profit_abs, tick)?
+        } else {
+            "0".into()
+        };
+        self.set_stop(ex, t, &quantize(t.stop_loss_abs, tick)?, &tp)
+            .await
     }
     pub async fn sync_external_exit(&self, c: &Config, t: &Trade, ex: &Bybit) -> Result<bool> {
         let positions = ex.positions().await?;
@@ -593,8 +677,8 @@ impl App {
             .map(|p| num(&p["size"]))
             .sum();
         if (amount - t.amount).abs() <= t.amount * 1e-8 {
-            // Restore the exchange-hosted stop if it was removed or differs from
-            // the fill-based stop. Never rely only on the submission-time quote.
+            // Restore the exchange-hosted stop and take profit if either was removed or
+            // differs from the record. Never rely only on the submission-time quote.
             let p = positions
                 .iter()
                 .find(|p| {
@@ -603,14 +687,29 @@ impl App {
                 })
                 .context("缺少合约仓位")?;
             let ins = ex.instrument(&t.market, &t.pair).await?;
-            let tick = ins["priceFilter"]["tickSize"]
-                .as_str()
-                .context("缺少价格精度")?;
-            let desired = quantize(t.stop_loss_abs, tick)?;
-            if (num(&p["stopLoss"]) - desired.parse::<f64>()?).abs()
-                > num(&ins["priceFilter"]["tickSize"]) * 0.5
+            let tick = num(&ins["priceFilter"]["tickSize"]);
+            let want_sl: f64 = quantize(
+                t.stop_loss_abs,
+                ins["priceFilter"]["tickSize"]
+                    .as_str()
+                    .context("缺少价格精度")?,
+            )?
+            .parse()?;
+            let want_tp: f64 = if t.take_profit_abs > 0.0 {
+                quantize(
+                    t.take_profit_abs,
+                    ins["priceFilter"]["tickSize"]
+                        .as_str()
+                        .context("缺少价格精度")?,
+                )?
+                .parse()?
+            } else {
+                0.0
+            };
+            if (num(&p["stopLoss"]) - want_sl).abs() > tick * 0.5
+                || (num(&p["takeProfit"]) - want_tp).abs() > tick * 0.5
             {
-                self.set_stop(ex, t, &desired).await?;
+                self.push_stops(ex, t).await?;
             }
             return Ok(false);
         }
@@ -667,8 +766,15 @@ impl App {
             .sum();
         let fee: f64 = fills.iter().map(|e| num(&e["execFee"])).sum();
         let link = format!("external-{}", t.trade_id);
-        let order =
-            json!({"link":link,"action":"exit","data":{"trade":t,"reason":"stoploss_on_exchange"}});
+        let exit_price = value / qty;
+        let reason = if t.take_profit_abs > 0.0
+            && (exit_price - t.take_profit_abs).abs() < (exit_price - t.stop_loss_abs).abs()
+        {
+            "take_profit_on_exchange"
+        } else {
+            "stoploss_on_exchange"
+        };
+        let order = json!({"link":link,"action":"exit","data":{"trade":t,"reason":reason}});
         // This is an already confirmed external fill, not an outgoing order.
         // settle_exit records it atomically; no synthetic pending order can be
         // left behind if the process stops before committing the trade.
@@ -696,7 +802,7 @@ impl App {
         let ex = self.exchange(&c);
         // Risk exits continue while new entries are paused.
         let mut risk_errors = Vec::new();
-        for mut t in self.store.open_trades()? {
+        for t in self.store.open_trades()? {
             let result: Result<()> = async {
                 if self.store.unresolved()?.iter().any(|o| o["pair"] == t.pair) {
                     return Ok(());
@@ -704,35 +810,19 @@ impl App {
                 if t.market == "futures" && self.sync_external_exit(&c, &t, &ex).await? {
                     return Ok(());
                 }
-                let price = ex.price(&t.market, &t.pair).await?;
-                let (peak, stop) = stop_price(&t, price);
-                let previous = t.stop_loss_abs;
-                // Persist first: if the exchange update fails, the next sync_external_exit
-                // sees the difference and restores the stop from this record.
-                t.peak = peak;
-                t.stop_loss_abs = stop;
-                self.store.update_trade(&t)?;
-                if t.market == "futures" && stop != previous {
-                    let ins = ex.instrument(&t.market, &t.pair).await?;
-                    let tick = ins["priceFilter"]["tickSize"]
-                        .as_str()
-                        .context("缺少价格精度")?;
-                    let desired = quantize(stop, tick)?;
-                    // Moves smaller than one tick round to the current stop; nothing to send.
-                    if desired != quantize(previous, tick)? {
-                        self.set_stop(&ex, &t, &desired).await?;
+                // Futures stops live on the exchange; only spot is watched here.
+                if t.market == "spot" {
+                    let price = ex.price(&t.market, &t.pair).await?;
+                    let reason = if price <= t.stop_loss_abs {
+                        Some("stop_loss")
+                    } else if t.take_profit_abs > 0.0 && price >= t.take_profit_abs {
+                        Some("take_profit")
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = reason {
+                        self.close_position(t.trade_id, reason).await?;
                     }
-                }
-                if t.market == "spot" && price <= stop {
-                    self.close_position(
-                        t.trade_id,
-                        if peak >= t.open_rate * (1.0 + trail_params(&t).0) {
-                            "trailing_stop_loss"
-                        } else {
-                            "stop_loss"
-                        },
-                    )
-                    .await?;
                 }
                 Ok(())
             }
@@ -749,7 +839,7 @@ impl App {
             risk_errors.join("；")
         );
         // AI is the only automatic entry and discretionary exit mode. The loop
-        // above remains responsible for exchange-side stops and trailing stops
+        // above remains responsible for the stop-loss and take-profit set by the AI
         // even while the bot is paused or AI analysis is disabled.
         Ok(())
     }
@@ -829,7 +919,14 @@ mod tests {
     }
 
     #[test]
-    fn trailing_uses_the_trade_stop_distance() {
+    fn ai_stops_are_clamped_and_only_tighten() {
+        assert_eq!(requested_stop(0.5).unwrap(), 0.02);
+        assert_eq!(requested_stop(4.0).unwrap(), 0.04);
+        assert_eq!(requested_stop(30.0).unwrap(), 0.10);
+        assert!(requested_stop(0.0).is_err() && requested_stop(f64::NAN).is_err());
+        assert!((take_profit_from_pct(100.0, 8.0, false).unwrap() - 108.0).abs() < 1e-9);
+        assert!((take_profit_from_pct(100.0, 8.0, true).unwrap() - 92.0).abs() < 1e-9);
+        assert!(take_profit_from_pct(100.0, 100.0, true).is_err());
         let mut t = Trade {
             trade_id: 1,
             pair: "BTC/USDT".into(),
@@ -845,6 +942,7 @@ mod tests {
             profit_abs: 0.0,
             profit_ratio: 0.0,
             stop_loss_abs: 95.0,
+            take_profit_abs: 0.0,
             peak: 100.0,
             enter_tag: "ai".into(),
             exit_reason: None,
@@ -852,22 +950,19 @@ mod tests {
             stop_dist: 0.05,
             funding: 0.0,
         };
-        assert_eq!(stop_price(&t, 104.0), (104.0, 95.0));
-        let (peak, stop) = stop_price(&t, 110.0);
-        assert_eq!(peak, 110.0);
-        assert!((stop - 107.25).abs() < 1e-9);
+        assert!(check_new_stops(&t, 110.0, Some(105.0), Some(120.0)).is_ok());
+        assert!(check_new_stops(&t, 110.0, Some(95.0), None).is_ok());
+        assert!(check_new_stops(&t, 110.0, Some(94.0), None).is_err());
+        assert!(check_new_stops(&t, 110.0, Some(111.0), None).is_err());
+        assert!(check_new_stops(&t, 110.0, None, Some(105.0)).is_err());
+        assert!(check_new_stops(&t, 110.0, None, Some(0.0)).is_ok());
+        assert!(check_new_stops(&t, 110.0, None, None).is_err());
         t.is_short = true;
-        t.peak = 100.0;
         t.stop_loss_abs = 105.0;
-        let (_, stop) = stop_price(&t, 90.0);
-        assert!((stop - 92.25).abs() < 1e-9);
-        // Legacy trades without a recorded distance keep 6% / 3%.
-        t.is_short = false;
-        t.stop_dist = 0.0;
-        t.peak = 100.0;
-        t.stop_loss_abs = 92.0;
-        let (_, stop) = stop_price(&t, 106.0);
-        assert!((stop - 102.82).abs() < 1e-9);
+        assert!(check_new_stops(&t, 90.0, Some(100.0), Some(80.0)).is_ok());
+        assert!(check_new_stops(&t, 90.0, Some(106.0), None).is_err());
+        assert!(check_new_stops(&t, 90.0, Some(89.0), None).is_err());
+        assert!(check_new_stops(&t, 90.0, None, Some(95.0)).is_err());
     }
 
     #[test]

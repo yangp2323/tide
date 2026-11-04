@@ -51,7 +51,7 @@ export default function StrategyPage() {
   const maxPairs = d.max_pairs ?? 12;
   const maxOpen = d.max_open_limit ?? 5;
   const maxLev = d.max_leverage ?? 25;
-  // 止损为 2.5×ATR，限制在 2%–10%；系统按止损距离逐笔下调杠杆，使止损不超过强平距离的 60%。
+  // 止损由 AI 给出（默认参考 2.5×ATR），限制在 2%–10%；系统按止损距离逐笔下调杠杆，使止损不超过强平距离的 60%。
   const stopLo = 0.02;
   const stopHi = 0.1;
   const levFor = (stop: number) => Math.max(1, Math.min(cur.leverage, Math.floor(0.6 / stop + 1e-9)));
@@ -193,7 +193,7 @@ export default function StrategyPage() {
   const ch = changes();
   return (
     <>
-      <Card title="交易配置" note="AI 交易 · 4 小时行情 · 2.5×ATR 止损">
+      <Card title="交易配置" note="AI 交易 · 4 小时行情 · AI 设置止盈止损">
         <div className="fields">
           <div className="field">
             <b>市场</b>

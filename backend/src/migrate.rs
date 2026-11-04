@@ -86,6 +86,7 @@ pub fn run(store: &Store, old: &Path) -> Result<()> {
                 profit_abs: num(&v["close_profit_abs"]),
                 profit_ratio: num(&v["close_profit"]),
                 stop_loss_abs: num(&v["stop_loss"]),
+                take_profit_abs: 0.0,
                 peak: price,
                 enter_tag: v["enter_tag"].as_str().unwrap_or("trend").into(),
                 exit_reason: v["exit_reason"].as_str().map(str::to_string),

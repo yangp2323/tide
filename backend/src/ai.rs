@@ -1,5 +1,5 @@
 use crate::{
-    engine::stop_distance,
+    engine::{stop_distance, Stops},
     indicators,
     model::{now, num, AiConfig, Config},
     App,
@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 const SYSTEM: &str = r#"You manage a Bybit crypto account. Your primary objective is to grow account equity through positive expected net profit over repeated trades, accounting for fees, slippage and funding costs where applicable. Actively seek evidence-backed long and short opportunities within the supplied risk limits. Evaluate entries, holding and exits by their expected future return; do not make breaking even on a position the objective. Do not force trades when the evidence does not support positive expected net profit, and do not invent unavailable cost estimates or imply guaranteed returns.
-Use only the supplied closed candles and account snapshot. Return only a JSON object {"analysis":"简体中文分析","actions":[{"action":"open_long|open_short|close","pair":"exact pair from snapshot","confidence":0.0,"reason":"简体中文理由"}]}. Explain the opportunity or lack of opportunity using specific supplied trend, momentum, volatility and price signals, including the expected direction and what would invalidate the thesis. For each action, explain how it serves the net profit objective. When actions is empty, explain the missing market evidence or binding constraint. Passing a risk check, such as remaining below the daily loss limit, is eligibility to trade and is not evidence of a profitable opportunity.
-Respect whitelist, concurrent position slots, daily loss and min confidence. Closed positions release slots and can be replaced by new longs or shorts; there is no daily entry count limit. Do not add to existing positions. Shorts only when short_allowed. System sizes each position so a stop-out loses about risk_per_trade_pct of equity, sets the stop at 2.5 × ATR(14) of the 4h candles (2% to 10% of price), lowers leverage per trade so the stop stays well ahead of liquidation, and trails the stop by half that distance once price has moved one stop distance in favor. The daily loss check counts realized PnL plus open floating losses. Confidence must be finite and between 0 and 1."#;
+Use only the supplied closed candles and account snapshot. Return only a JSON object {"analysis":"简体中文分析","actions":[{"action":"open_long|open_short|close|set_stops","pair":"exact pair from snapshot","confidence":0.0,"reason":"简体中文理由"}]}. For open_long/open_short also give stop_loss_pct and take_profit_pct (percent of entry price, e.g. 4.5). For set_stops on an open position give stop_loss_price and/or take_profit_price as absolute prices (take_profit_price 0 removes the take profit). Explain the opportunity or lack of opportunity using specific supplied trend, momentum, volatility and price signals, including the expected direction and what would invalidate the thesis. For each action, explain how it serves the net profit objective. When actions is empty, explain the missing market evidence or binding constraint. Passing a risk check, such as remaining below the daily loss limit, is eligibility to trade and is not evidence of a profitable opportunity.
+Respect whitelist, concurrent position slots, daily loss and min confidence. Closed positions release slots and can be replaced by new longs or shorts; there is no daily entry count limit. Do not add to existing positions. Shorts only when short_allowed. You own stop-loss and take-profit management; the system does not trail stops for you, so review every open position each run and tighten the stop or move the take profit when the evidence changes. stop_loss_pct is clamped to 2%-10% (default_atr_stop_pct in the snapshot is the 2.5 × ATR(14) 4h reference), and a stop can only be moved in the favorable direction, never loosened. Stops must sit on the loss side of the current price and take profits on the profit side. System sizes each position so a stop-out loses about risk_per_trade_pct of equity and lowers leverage per trade so the stop stays well ahead of liquidation. The exchange (futures) or the system (spot) executes the stop and take profit between runs. The daily loss check counts realized PnL plus open floating losses. Confidence must be finite and between 0 and 1."#;
 
 impl App {
     pub async fn snapshot(&self) -> Result<Value> {
@@ -22,7 +22,7 @@ impl App {
         let mut pairs = vec![];
         for t in &held {
             let price = ex.price(&t.market, &t.pair).await?;
-            positions.push(json!({"pair":t.pair,"side":if t.is_short{"short"}else{"long"},"open_rate":t.open_rate,"current_rate":price,"profit_pct":num(&t.mark(price)["profit_ratio"])*100.0,"stop_loss_rate":t.stop_loss_abs,"opened_utc":t.open_date,"entry_tag":t.enter_tag}));
+            positions.push(json!({"pair":t.pair,"side":if t.is_short{"short"}else{"long"},"open_rate":t.open_rate,"current_rate":price,"profit_pct":num(&t.mark(price)["profit_ratio"])*100.0,"stop_loss_rate":t.stop_loss_abs,"take_profit_rate":if t.take_profit_abs>0.0{json!(t.take_profit_abs)}else{Value::Null},"opened_utc":t.open_date,"entry_tag":t.enter_tag}));
         }
         for p in &c.pairs {
             let cs = ex.candles(&c.market, p, 240, 300, None).await?;
@@ -57,7 +57,7 @@ impl App {
                 (Some(c), Some(x)) => stop_distance(x.atr, c.close),
                 _ => None,
             };
-            pairs.push(json!({"pair":p,"stop_loss_price_pct":stop.map(|d| d * 100.0),"columns":["date","open","high","low","close","volume","ema20","ema50","ema200","adx","rsi","atr"],"candles":rows}));
+            pairs.push(json!({"pair":p,"default_atr_stop_pct":stop.map(|d| d * 100.0),"columns":["date","open","high","low","close","volume","ema20","ema50","ema200","adx","rsi","atr"],"candles":rows}));
         }
         Ok(
             json!({"time_utc":now(),"exchange":"bybit","market":c.market,"timeframe":"4h","leverage":c.leverage,"short_allowed":c.market=="futures"&&c.short,"bot_state":if c.running{"running"}else{"stopped"},
@@ -68,7 +68,11 @@ impl App {
     pub async fn execute_actions(&self, actions: &[Value], external: bool) -> Result<Vec<Value>> {
         let _lock = self.gate.lock().await;
         let mut acts = actions.to_vec();
-        acts.sort_by_key(|a| a["action"] != "close");
+        acts.sort_by_key(|a| match a["action"].as_str() {
+            Some("close") => 0,
+            Some("set_stops") => 1,
+            _ => 2,
+        });
         let mut out = vec![];
         for mut a in acts {
             let action = a["action"].as_str().context("缺少 action")?.to_string();
@@ -90,14 +94,39 @@ impl App {
                     Some(t) => self.close_position(t.trade_id, "force_exit").await,
                     None => Err(anyhow::anyhow!("没有该交易对持仓")),
                 }
+            } else if action == "set_stops" {
+                match held.iter().find(|t| t.pair == canonical) {
+                    Some(t) => match (
+                        opt_num(&a, "stop_loss_price"),
+                        opt_num(&a, "take_profit_price"),
+                    ) {
+                        (Ok(stop), Ok(tp)) => self.set_stops(t.trade_id, stop, tp).await,
+                        (Err(e), _) | (_, Err(e)) => Err(e),
+                    },
+                    None => Err(anyhow::anyhow!("没有该交易对持仓")),
+                }
             } else if action == "open_long" || action == "open_short" {
                 let confidence = if external {
                     None
                 } else {
                     Some(a["confidence"].as_f64().unwrap_or(f64::NAN))
                 };
-                self.open_position(&canonical, action == "open_short", "ai", confidence)
-                    .await
+                match (opt_num(&a, "stop_loss_pct"), opt_num(&a, "take_profit_pct")) {
+                    (Ok(stop_pct), Ok(take_profit_pct)) => {
+                        self.open_position(
+                            &canonical,
+                            action == "open_short",
+                            "ai",
+                            confidence,
+                            Stops {
+                                stop_pct,
+                                take_profit_pct,
+                            },
+                        )
+                        .await
+                    }
+                    (Err(e), _) | (_, Err(e)) => Err(e),
+                }
             } else {
                 Err(anyhow::anyhow!("未知 action"))
             };
@@ -141,7 +170,7 @@ impl App {
                 ensure!(
                     matches!(
                         a["action"].as_str(),
-                        Some("open_long" | "open_short" | "close")
+                        Some("open_long" | "open_short" | "close" | "set_stops")
                     ) && a["pair"].is_string()
                         && a["confidence"]
                             .as_f64()
@@ -173,6 +202,16 @@ impl App {
             let _ = self.telegram(&c, &format!("AI 决策：{}", rec)).await;
         }
         Ok(rec)
+    }
+}
+/// An optional numeric field: absent or null is None, anything else must be a number.
+fn opt_num(a: &Value, key: &str) -> Result<Option<f64>> {
+    match &a[key] {
+        Value::Null => Ok(None),
+        v => v
+            .as_f64()
+            .map(Some)
+            .with_context(|| format!("{} 必须是数字", key)),
     }
 }
 async fn call_model(c: &Config, snap: &Value) -> Result<(String, Value)> {

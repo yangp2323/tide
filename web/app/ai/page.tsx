@@ -173,7 +173,7 @@ export default function AiPage() {
     if (want) {
       const ok = await confirm({
         title: "开启 AI 交易？",
-        body: "开启后由大模型决定开仓和平仓，用的是实盘真钱。系统仍会独立执行止损和移动止盈。",
+        body: "开启后由大模型决定开仓和平仓，用的是实盘真钱。止损和止盈也由大模型设置，系统负责执行。",
         ok: "开启",
         danger: true,
         expect: "YES",
@@ -209,8 +209,7 @@ export default function AiPage() {
       <div className="grid g2">
         <Card title="AI 交易" right={<StateLabel on={on}>{on ? "运行中" : "未开启"}</StateLabel>}>
           <p className="hint">
-            开启后，<b>所有自动开平仓都由大模型决定</b>，按设定间隔分析行情和持仓。每笔金额（按风险比例）、杠杆、2.5×ATR
-            止损、移动止盈仍由系统执行，大模型改不了。
+            开启后，<b>所有自动开平仓都由大模型决定</b>，按设定间隔分析行情和持仓。止损（2%–10%）和止盈由大模型设置，之后只能收紧止损、不能放宽；每笔金额（按风险比例）和杠杆仍由系统按止损距离计算，大模型改不了。
           </p>
           <div className="risk" style={{ marginTop: 12 }}>
             <div>

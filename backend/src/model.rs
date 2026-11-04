@@ -105,6 +105,9 @@ pub struct Trade {
     pub profit_abs: f64,
     pub profit_ratio: f64,
     pub stop_loss_abs: f64,
+    /// Take-profit price chosen by the AI; 0 means none.
+    #[serde(default)]
+    pub take_profit_abs: f64,
     pub peak: f64,
     pub enter_tag: String,
     pub exit_reason: Option<String>,

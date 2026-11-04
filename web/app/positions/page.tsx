@@ -71,6 +71,7 @@ export default function PositionsPage() {
                   {fut && <th className="r">杠杆</th>}
                   {fut && <th className="r">爆仓价</th>}
                   <th className="r">止损价</th>
+                  <th className="r">止盈价</th>
                   <th className="r">{fut ? "保证金" : "投入"}</th>
                   <th className="r">浮动盈亏</th>
                   <th />
@@ -89,6 +90,7 @@ export default function PositionsPage() {
                     {fut && <td className="r">{t.leverage}×</td>}
                     {fut && <td className="r down">{price(t.liquidation_price)}</td>}
                     <td className="r">{price(t.stop_loss_abs)}</td>
+                    <td className="r">{t.take_profit_abs > 0 ? price(t.take_profit_abs) : "—"}</td>
                     <td className="r">{money(t.stake_amount)}</td>
                     <td className={"r " + sign(t.profit_abs)}>
                       {money(t.profit_abs)} · {pct(t.profit_ratio)}
