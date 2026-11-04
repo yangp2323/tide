@@ -227,6 +227,9 @@ async fn handle(
             .run_ai(q.get("execute").is_some_and(|s| s == "true"), "manual")
             .await;
     }
+    if method == "POST" && path == "/api/ai/review" {
+        return app.review("manual").await;
+    }
     if method == "POST" && path == "/api/ai/order" {
         let actions = app
             .execute_actions(std::slice::from_ref(&body), true)
@@ -438,7 +441,7 @@ async fn handle(
             let (title, content, source, enabled) = knowledge_fields(&body, None)?;
             let id = app
                 .store
-                .knowledge_add(&title, &content, &source, enabled)?;
+                .knowledge_add(&title, &content, &source, enabled, "user")?;
             return Ok(json!({"id":id}));
         }
         _ if method == "POST" && path.starts_with("/api/knowledge/") => {

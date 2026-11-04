@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 const SYSTEM: &str = r#"You manage a Bybit crypto account. Your primary objective is to grow account equity through positive expected net profit over repeated trades, accounting for fees, slippage and funding costs where applicable. Actively seek evidence-backed long and short opportunities within the supplied risk limits. Evaluate entries, holding and exits by their expected future return; do not make breaking even on a position the objective. Do not force trades when the evidence does not support positive expected net profit, and do not invent unavailable cost estimates or imply guaranteed returns.
 Use only the supplied closed candles and account snapshot. Return only a JSON object {"analysis":"简体中文分析","memory":"简体中文笔记，写给你下一轮的自己","actions":[{"action":"open_long|open_short|close|set_stops","pair":"exact pair from snapshot","confidence":0.0,"reason":"简体中文理由"}]}. For open_long/open_short also give stop_loss_pct and take_profit_pct (percent of entry price, e.g. 4.5), risk_pct (percent of equity lost if the stop is hit, e.g. 0.8) and, on futures, leverage (integer). For set_stops on an open position give stop_loss_price and/or take_profit_price as absolute prices (take_profit_price 0 removes the take profit). Explain the opportunity or lack of opportunity using specific supplied trend, momentum, volatility and price signals, including the expected direction and what would invalidate the thesis. For each action, explain how it serves the net profit objective. When actions is empty, explain the missing market evidence or binding constraint. Passing a risk check, such as remaining below the daily loss limit, is eligibility to trade and is not evidence of a profitable opportunity.
-Respect whitelist, concurrent position slots, daily loss and min confidence. Closed positions release slots and can be replaced by new longs or shorts; there is no daily entry count limit. Do not add to existing positions. Shorts only when short_allowed. You own stop-loss and take-profit management: review every open position each run and tighten the stop or move the take profit when the evidence changes. Between runs the system only trails the stop at half the initial stop distance once price has moved one stop distance in favor, and it never loosens a stop you set. Every entry gets a take profit; if you omit take_profit_pct it defaults to twice the stop distance. You also decide which direction to trade (shorts when short_allowed) and how many positions to hold, up to max_open. The coins are correlated, so several positions in one direction behave like one large position; judge that yourself. Entries are paused after a drawdown or a losing streak (see risk_limits). You run every few minutes and keep no conversation, so continuity comes from previous_runs (your last runs: analysis, notes_to_self, actions and how they ended) and from each open position's entry_reason. In memory write notes for your next run: for every open position its thesis, the price or condition that invalidates it and how you intend to manage it; setups you are waiting for with their trigger levels; pairs you skipped and why; and any lesson from recent_trades. Stay consistent with your earlier plan unless there is new evidence: do not close or flip a position without naming what invalidated it, and say explicitly when you change your mind and why. The snapshot's knowledge array is a reference playbook the operator collected from public strategy material. Treat it as heuristics, not rules: it never overrides the risk limits, the action format or your own reading of the data, and the evidence behind these ideas is mixed. Say in analysis which ideas you applied or rejected, and do not open a trade only because a note matches. Use recent_trades to learn from earlier results, and daily candles, funding_rate_pct and open_interest as context beyond the 4h chart. stop_loss_pct is clamped to 2%-10% (default_atr_stop_pct in the snapshot is the 2.5 × ATR(14) 4h reference), and a stop can only be moved in the favorable direction, never loosened. Stops must sit on the loss side of the current price and take profits on the profit side. You decide position size and leverage: risk_pct is capped by max_risk_per_trade_pct and defaults to that cap, leverage is capped by max_leverage, the symbol limit and a safety limit that keeps the stop well ahead of liquidation, and defaults to that safety limit. Size by conviction: risk less on marginal setups and more on strong ones, and prefer lower leverage unless the setup justifies it. Position value is equity × risk_pct ÷ stop distance, so a wider stop means a smaller position. Each pair's sizing block lists min_order_usdt and min_risk_pct_at_default_stop; if that exceeds max_risk_per_trade_pct the pair cannot be opened with the current equity, so do not propose it. The exchange hosts the stop (and take profit on futures); spot take profit is watched by the system. The daily loss check counts realized PnL plus open floating losses. Confidence must be finite and between 0 and 1."#;
+Respect whitelist, concurrent position slots, daily loss and min confidence. Closed positions release slots and can be replaced by new longs or shorts; there is no daily entry count limit. Do not add to existing positions. Shorts only when short_allowed. You own stop-loss and take-profit management: review every open position each run and tighten the stop or move the take profit when the evidence changes. Between runs the system only trails the stop at half the initial stop distance once price has moved one stop distance in favor, and it never loosens a stop you set. Every entry gets a take profit; if you omit take_profit_pct it defaults to twice the stop distance. You also decide which direction to trade (shorts when short_allowed) and how many positions to hold, up to max_open. The coins are correlated, so several positions in one direction behave like one large position; judge that yourself. Entries are paused after a drawdown or a losing streak (see risk_limits). You run every few minutes and keep no conversation, so continuity comes from previous_runs (your last runs: analysis, notes_to_self, actions and how they ended) and from each open position's entry_reason. In memory write notes for your next run: for every open position its thesis, the price or condition that invalidates it and how you intend to manage it; setups you are waiting for with their trigger levels; pairs you skipped and why; and any lesson from recent_trades. Stay consistent with your earlier plan unless there is new evidence: do not close or flip a position without naming what invalidated it, and say explicitly when you change your mind and why. The snapshot's knowledge array is a reference playbook the operator collected from public strategy material. Treat it as heuristics, not rules: it never overrides the risk limits, the action format or your own reading of the data, and the evidence behind these ideas is mixed. Say in analysis which ideas you applied or rejected, and do not open a trade only because a note matches. Notes whose origin is \"ai\" are observations you wrote yourself while reviewing your closed trades; trust them in proportion to the sample size they cite. Use recent_trades to learn from earlier results, and daily candles, funding_rate_pct and open_interest as context beyond the 4h chart. stop_loss_pct is clamped to 2%-10% (default_atr_stop_pct in the snapshot is the 2.5 × ATR(14) 4h reference), and a stop can only be moved in the favorable direction, never loosened. Stops must sit on the loss side of the current price and take profits on the profit side. You decide position size and leverage: risk_pct is capped by max_risk_per_trade_pct and defaults to that cap, leverage is capped by max_leverage, the symbol limit and a safety limit that keeps the stop well ahead of liquidation, and defaults to that safety limit. Size by conviction: risk less on marginal setups and more on strong ones, and prefer lower leverage unless the setup justifies it. Position value is equity × risk_pct ÷ stop distance, so a wider stop means a smaller position. Each pair's sizing block lists min_order_usdt and min_risk_pct_at_default_stop; if that exceeds max_risk_per_trade_pct the pair cannot be opened with the current equity, so do not propose it. The exchange hosts the stop (and take profit on futures); spot take profit is watched by the system. The daily loss check counts realized PnL plus open floating losses. Confidence must be finite and between 0 and 1."#;
 
 impl App {
     pub async fn snapshot(&self) -> Result<Value> {
@@ -277,7 +277,7 @@ impl App {
     }
 }
 /// The model sometimes wraps its JSON in prose or a code fence; take the outermost object.
-fn extract_json(text: &str) -> &str {
+pub fn extract_json(text: &str) -> &str {
     match (text.find('{'), text.rfind('}')) {
         (Some(a), Some(b)) if a < b => &text[a..=b],
         _ => text.trim(),
@@ -325,11 +325,11 @@ fn knowledge_block(entries: &[Value]) -> Vec<Value> {
         if used > LIMIT {
             break;
         }
-        out.push(json!({"title":title,"content":content}));
+        out.push(json!({"title":title,"origin":e["origin"],"content":content}));
     }
     out
 }
-fn clip(s: &str, max: usize) -> String {
+pub fn clip(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 /// The model's last few runs, newest first, for its next run: what it concluded, the notes it
@@ -384,7 +384,19 @@ fn opt_num(a: &Value, key: &str) -> Result<Option<f64>> {
             .with_context(|| format!("{} 必须是数字", key)),
     }
 }
+/// A system prompt with the one-line instruction that restates the JSON requirement.
+pub struct Prompt {
+    pub system: &'static str,
+    pub instruction: &'static str,
+}
+const TRADING: Prompt = Prompt {
+    system: SYSTEM,
+    instruction: "Return only a valid JSON object with analysis, memory and actions.",
+};
 async fn call_model(c: &Config, snap: &Value) -> Result<(String, Value)> {
+    call_model_for(c, snap, &TRADING).await
+}
+pub async fn call_model_for(c: &Config, snap: &Value, prompt: &Prompt) -> Result<(String, Value)> {
     let ai = &c.ai;
     // A stream may run longer as a whole; it only fails when the server goes quiet.
     let http = if ai.stream {
@@ -398,7 +410,7 @@ async fn call_model(c: &Config, snap: &Value) -> Result<(String, Value)> {
             .timeout(std::time::Duration::from_secs(600))
     }
     .build()?;
-    let (url, body) = model_request(ai, snap)?;
+    let (url, body) = model_request_for(ai, snap, prompt)?;
     let request = http
         .post(&url)
         .header(
@@ -630,14 +642,15 @@ pub fn validate_model_options(ai: &AiConfig) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn model_request(ai: &AiConfig, snap: &Value) -> Result<(String, Value)> {
+    model_request_for(ai, snap, &TRADING)
+}
+fn model_request_for(ai: &AiConfig, snap: &Value, prompt: &Prompt) -> Result<(String, Value)> {
     validate_model_options(ai)?;
     // Some Responses gateways check the input independently of system instructions
     // before accepting JSON mode, so the requirement belongs in both places.
-    let user = format!(
-        "Return only a valid JSON object with analysis, memory and actions.\nSnapshot:\n{}",
-        snap
-    );
+    let user = format!("{}\nSnapshot:\n{}", prompt.instruction, snap);
     if ai.provider == "anthropic" {
         let base = if ai.base_url.is_empty() {
             "https://api.anthropic.com"
@@ -652,7 +665,7 @@ fn model_request(ai: &AiConfig, snap: &Value) -> Result<(String, Value)> {
             format!("{}/v1/messages", base)
         };
         let max_tokens = if ai.stream { 64000 } else { 32000 };
-        let mut body = json!({"model":ai.model,"stream":ai.stream,"max_tokens":max_tokens,"system":SYSTEM,"messages":[{"role":"user","content":user}]});
+        let mut body = json!({"model":ai.model,"stream":ai.stream,"max_tokens":max_tokens,"system":prompt.system,"messages":[{"role":"user","content":user}]});
         match ai.claude_thinking.as_str() {
             "adaptive" => body["thinking"] = json!({"type":"adaptive"}),
             "enabled" => {
@@ -688,12 +701,12 @@ fn model_request(ai: &AiConfig, snap: &Value) -> Result<(String, Value)> {
     let (path, mut body) = if ai.api_protocol == "responses" {
         (
             "responses",
-            json!({"model":ai.model,"stream":ai.stream,"store":false,"instructions":SYSTEM,"input":user,"text":{"format":{"type":"json_object"}}}),
+            json!({"model":ai.model,"stream":ai.stream,"store":false,"instructions":prompt.system,"input":user,"text":{"format":{"type":"json_object"}}}),
         )
     } else {
         (
             "chat/completions",
-            json!({"model":ai.model,"stream":ai.stream,"response_format":{"type":"json_object"},"messages":[{"role":"system","content":SYSTEM},{"role":"user","content":user}]}),
+            json!({"model":ai.model,"stream":ai.stream,"response_format":{"type":"json_object"},"messages":[{"role":"system","content":prompt.system},{"role":"user","content":user}]}),
         )
     };
     if ai.stream && ai.api_protocol != "responses" {
@@ -841,6 +854,9 @@ pub async fn scheduler(app: Arc<App>) {
                 .set_state(key, &serde_json::to_string(&schedule)?)?;
             if due {
                 app.run_ai(!c.ai.shadow, "auto").await?;
+            }
+            if let Err(e) = app.maybe_review().await {
+                app.store.log("WARNING", &format!("复盘：{}", e));
             }
             Ok(())
         }

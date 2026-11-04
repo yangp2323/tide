@@ -5,7 +5,9 @@ import { api, del, post } from "@/lib/api";
 import { when } from "@/lib/fmt";
 import { Card, Empty, MsgBox, Skeleton, useAction } from "@/lib/ui";
 
-type Note = { id: number; title: string; content: string; source: string; enabled: boolean; updated: string };
+type Note = { id: number; title: string; content: string; source: string; enabled: boolean; updated: string; origin: string };
+
+const ORIGIN: Record<string, string> = { seed: "预置", user: "我的", ai: "AI 观察" };
 
 // Keep in step with the limit the server applies when it builds the model request.
 const LIMIT = 24000;
@@ -50,7 +52,9 @@ function NoteCard({ note, busy, run, reload }: { note: Note; busy: string; run: 
           <input type="checkbox" checked={note.enabled} disabled={busy === `toggle-${note.id}`} onChange={(e) => toggle(e.target.checked)} />
           <span>{note.enabled ? "AI 会参考" : "已停用"}</span>
         </label>
-        <span className="muted">更新于 {when(note.updated)}</span>
+        <span className="muted">
+          {ORIGIN[note.origin] || note.origin} · 更新于 {when(note.updated)}
+        </span>
       </div>
       <input value={title} maxLength={80} aria-label="标题" onChange={(e) => setTitle(e.target.value)} />
       <textarea value={content} maxLength={4000} rows={Math.min(14, Math.max(5, content.split("\n").length + 1))} aria-label="内容" onChange={(e) => setContent(e.target.value)} />
@@ -105,7 +109,7 @@ export default function KnowledgePage() {
     <>
       <Card title="知识库" note={notes ? `${notes.filter((n) => n.enabled).length} / ${notes.length} 条启用 · 约 ${used.toLocaleString()} / ${LIMIT.toLocaleString()} 字` : ""}>
         <p className="hint">
-          这里的笔记会随每一轮分析发给 AI，当作策略参考。它们只是启发，不是规则：不会覆盖风控限制，AI 会在分析里说明参考或否决了哪几条。预置的几条来自公开资料，多为博客和教程，证据强弱不一，各条里已注明；你可以改、停用或删除，也可以加自己的经验。启用的内容总量超过上限时，靠后的笔记不会被发送。
+          这里的笔记会随每一轮分析发给 AI，当作策略参考。标为“AI 观察”的是 AI 复盘自己的交易后写的，只有它能改这些（你也可以编辑、停用或删除）。它们只是启发，不是规则：不会覆盖风控限制，AI 会在分析里说明参考或否决了哪几条。预置的几条来自公开资料，多为博客和教程，证据强弱不一，各条里已注明；你可以改、停用或删除，也可以加自己的经验。启用的内容总量超过上限时，靠后的笔记不会被发送。
         </p>
         <MsgBox m={msg} />
         {err ? <div className="msg err">{err}</div> : null}

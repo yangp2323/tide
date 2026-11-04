@@ -40,6 +40,7 @@ type Cfg = {
   max_drawdown_pct: number;
   max_consecutive_losses: number;
   shadow: boolean;
+  review: boolean;
   enabled: boolean;
 };
 
@@ -68,6 +69,15 @@ function DecisionRow({ r }: { r: any }) {
       </div>
       {r.error ? <div className="msg err">{r.error}</div> : null}
       {r.analysis ? <p>{r.analysis}</p> : null}
+      {(r.changes || []).map((c: any, i: number) => (
+        <div className="ai-act" key={`c${i}`}>
+          <span className={"st " + (c.status === "applied" ? "executed" : "failed")}>{c.status === "applied" ? "已写入" : "已跳过"}</span>
+          <b>
+            {{ add: "新增笔记", update: "更新笔记", delete: "删除笔记" }[c.op as string] || c.op} {c.title || ""}
+          </b>
+          {c.note ? <div className="muted">{c.note}</div> : null}
+        </div>
+      ))}
       {r.memory ? <p className="muted">给下一轮的笔记：{r.memory}</p> : null}
       {acts.length ? (
         acts.map((a, i) => (
@@ -81,7 +91,7 @@ function DecisionRow({ r }: { r: any }) {
             {a.note ? <div className="muted">{a.note}</div> : null}
           </div>
         ))
-      ) : r.error ? null : (
+      ) : r.error || r.source === "review" ? null : (
         <div className="ai-act muted">观望，不操作</div>
       )}
     </div>
@@ -114,6 +124,7 @@ export default function AiPage() {
   const [drawdown, setDrawdown] = useState(20);
   const [streak, setStreak] = useState(5);
   const [shadow, setShadow] = useState(false);
+  const [review, setReview] = useState(true);
 
   const selectEdit = useCallback((id: string) => {
     editRef.current = id;
@@ -140,6 +151,7 @@ export default function AiPage() {
     setDrawdown(c.max_drawdown_pct ?? 20);
     setStreak(c.max_consecutive_losses ?? 5);
     setShadow(!!c.shadow);
+    setReview(c.review !== false);
   }, []);
 
   const load = useCallback(async (prefer?: string) => {
@@ -255,6 +267,7 @@ export default function AiPage() {
         max_drawdown_pct: drawdown,
         max_consecutive_losses: streak,
         shadow,
+        review,
       });
       setApiKey("");
       await load();
@@ -277,6 +290,14 @@ export default function AiPage() {
       await post("/api/ai/enable", { enabled: want });
       await load();
       return { kind: "good", text: want ? "已开启 AI 交易。" : "已关闭自动交易。" };
+    });
+  }
+
+  async function reviewNow() {
+    await run("review", async () => {
+      const r = await post<any>("/api/ai/review");
+      await load();
+      return r.error ? { kind: "err", text: r.error } : { kind: "good", text: "复盘完成，结果在下方决策记录，笔记在知识库页。" };
     });
   }
 
@@ -335,6 +356,9 @@ export default function AiPage() {
                 立即分析并执行
               </button>
             )}
+            <button className="ghost" onClick={reviewNow} disabled={busy === "review" || busy === "run"}>
+              {busy === "review" ? "复盘中…" : "立即复盘"}
+            </button>
           </div>
           <MsgBox m={msg} />
           {st?.last_error && !st.running ? <div className="msg warn">上次出错：{st.last_error}</div> : null}
@@ -521,6 +545,13 @@ export default function AiPage() {
                   <input id="aiStreak" type="number" step={1} min={0} max={50} value={streak} onChange={(e) => setStreak(+e.target.value)} />
                 </div>
               </div>
+              <label className="toggle" style={{ marginTop: 12 }}>
+                <input type="checkbox" checked={review} onChange={(e) => setReview(e.target.checked)} />
+                <span>AI 复盘学习</span>
+              </label>
+              <p className="hint">
+                新平仓的交易累计 3 笔（或 1 笔且距上次复盘超过一天）后，AI 自动复盘：看胜率、各种出场方式的盈亏、币种方向和持仓时长的统计，把有数据支持的观察写进知识库（最多 12 条，只能改自己写的）。每次复盘会多用一次模型调用；你可以在知识库页停用或删除它写的笔记。
+              </p>
               <label className="toggle" style={{ marginTop: 12 }}>
                 <input type="checkbox" checked={shadow} onChange={(e) => setShadow(e.target.checked)} />
                 <span>影子模式</span>

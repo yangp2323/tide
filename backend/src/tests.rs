@@ -1019,3 +1019,190 @@ fn existing_config_moves_to_ai_managed_limits_once() {
     assert_eq!(store.config().unwrap().max_open, 2);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn the_reviewer_can_only_change_its_own_notes() {
+    let dir = std::env::temp_dir().join(format!("tide-review-{}", uuid::Uuid::new_v4()));
+    let store = store::Store::open(&dir).unwrap();
+    let app = App {
+        store,
+        http: reqwest::Client::new(),
+        auth: auth::Auth::create("admin".into(), "password").unwrap(),
+        secret: "01234567890123456789012345678901".into(),
+        origin: "https://trade.example.com".into(),
+        gate: Mutex::new(()),
+        ai_gate: Mutex::new(()),
+        ai_state: Mutex::new(json!({})),
+        login_attempts: Mutex::new(vec![]),
+    };
+    let seeded = app.store.knowledge().unwrap();
+    let seed_id = seeded[0]["id"].as_i64().unwrap();
+    assert!(seeded.iter().all(|n| n["origin"] == "seed"));
+    let out = app
+        .apply_review_changes(&[json!({"op":"add","title":"AI 平仓多数亏损","content":"14 笔主动平仓合计亏损，样本 14。"})])
+        .unwrap();
+    assert_eq!(out[0]["status"], "applied", "{}", out[0]);
+    let mine = out[0]["id"].as_i64().unwrap();
+    let note = |id: i64| {
+        app.store
+            .knowledge()
+            .unwrap()
+            .into_iter()
+            .find(|n| n["id"] == id)
+    };
+    assert_eq!(note(mine).unwrap()["origin"], "ai");
+    // The user's switch survives an update, and fields left out keep their values.
+    app.store
+        .knowledge_update(
+            mine,
+            "AI 平仓多数亏损",
+            "14 笔主动平仓合计亏损，样本 14。",
+            "AI 复盘",
+            false,
+        )
+        .unwrap();
+    let out = app
+        .apply_review_changes(&[json!({"op":"update","id":mine,"content":"更新后的内容"})])
+        .unwrap();
+    assert_eq!(out[0]["status"], "applied", "{}", out[0]);
+    let n = note(mine).unwrap();
+    assert_eq!(
+        (
+            n["title"].as_str(),
+            n["content"].as_str(),
+            n["enabled"].as_bool()
+        ),
+        (Some("AI 平仓多数亏损"), Some("更新后的内容"), Some(false))
+    );
+    // Built-in and hand-written notes are off limits; so are bad ids and unknown operations.
+    for bad in [
+        json!({"op":"update","id":seed_id,"content":"x"}),
+        json!({"op":"delete","id":seed_id}),
+        json!({"op":"delete","id":99999}),
+        json!({"op":"update","content":"x"}),
+        json!({"op":"add","title":"","content":"x"}),
+        json!({"op":"rewrite","id":mine}),
+    ] {
+        let out = app.apply_review_changes(&[bad]).unwrap();
+        assert_eq!(out[0]["status"], "skipped", "{}", out[0]);
+    }
+    assert!(note(seed_id).is_some());
+    // At most 12 of its own notes; the 13th is skipped.
+    for i in 0..11 {
+        let out = app
+            .apply_review_changes(&[json!({"op":"add","title":format!("n{}", i),"content":"c"})])
+            .unwrap();
+        assert_eq!(out[0]["status"], "applied", "{} {}", i, out[0]);
+    }
+    let out = app
+        .apply_review_changes(&[json!({"op":"add","title":"one too many","content":"c"})])
+        .unwrap();
+    assert_eq!(out[0]["status"], "skipped");
+    let out = app
+        .apply_review_changes(&[json!({"op":"delete","id":mine})])
+        .unwrap();
+    assert_eq!(out[0]["status"], "applied");
+    assert!(note(mine).is_none());
+    drop(app);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_review_reads_closed_trades_and_writes_notes() {
+    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+    async fn model(
+        State(seen): State<Arc<Mutex<Vec<Value>>>>,
+        body: axum::Json<Value>,
+    ) -> axum::Json<Value> {
+        seen.lock().await.push(body.0);
+        let reply = json!({"summary":"3 笔样本，主动平仓亏损","changes":[
+            {"op":"add","title":"主动平仓亏损","content":"样本 3：AI 主动平仓全部亏损，优先让止损单管理出场。"},
+            {"op":"delete","id":1}
+        ]});
+        axum::Json(
+            json!({"choices":[{"finish_reason":"stop","message":{"content":reply.to_string()}}],"usage":{"completion_tokens":9}}),
+        )
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/v1/chat/completions", axum::routing::post(model))
+                .with_state(seen.clone()),
+        )
+        .into_future(),
+    );
+    let dir = std::env::temp_dir().join(format!("tide-review-e2e-{}", uuid::Uuid::new_v4()));
+    let store = store::Store::open(&dir).unwrap();
+    let mut cfg = model::Config::default();
+    cfg.ai.provider = "openai".into();
+    cfg.ai.model = "review-model".into();
+    cfg.ai.api_key = "k".into();
+    cfg.ai.base_url = format!("http://{}/v1", addr);
+    store.save_config(&cfg).unwrap();
+    for (i, profit) in [-1.0, -2.0, -0.5].into_iter().enumerate() {
+        let t = model::Trade {
+            trade_id: 0,
+            pair: "XRP/USDT:USDT".into(),
+            market: "futures".into(),
+            is_short: false,
+            leverage: 5,
+            amount: 1.0,
+            open_rate: 1.0,
+            stake_amount: 1.0,
+            open_date: format!("2026-11-01 0{}:00:00", i),
+            close_rate: Some(1.0),
+            close_date: Some(format!("2026-11-01 0{}:30:00", i)),
+            profit_abs: profit,
+            profit_ratio: profit,
+            stop_loss_abs: 0.95,
+            take_profit_abs: 0.0,
+            peak: 1.0,
+            enter_tag: "ai".into(),
+            exit_reason: Some("force_exit".into()),
+            entry_fee: 0.0,
+            stop_dist: 0.05,
+            entry_reason: "突破".into(),
+            funding: 0.0,
+        };
+        store.insert_trade(t, "").unwrap();
+    }
+    let app = App {
+        store,
+        http: reqwest::Client::new(),
+        auth: auth::Auth::create("admin".into(), "password").unwrap(),
+        secret: "01234567890123456789012345678901".into(),
+        origin: "https://trade.example.com".into(),
+        gate: Mutex::new(()),
+        ai_gate: Mutex::new(()),
+        ai_state: Mutex::new(json!({})),
+        login_attempts: Mutex::new(vec![]),
+    };
+    let rec = app.review("manual").await.unwrap();
+    assert!(rec["error"].is_null(), "{}", rec);
+    assert_eq!(rec["changes"][0]["status"], "applied");
+    // id 1 is a built-in note, which the reviewer may not delete.
+    assert_eq!(rec["changes"][1]["status"], "skipped");
+    let notes = app.store.knowledge().unwrap();
+    assert!(notes
+        .iter()
+        .any(|n| n["origin"] == "ai" && n["title"] == "主动平仓亏损"));
+    assert!(notes.iter().any(|n| n["id"] == 1));
+    let request = seen.lock().await[0].clone();
+    assert_eq!(request["model"], "review-model");
+    assert!(request["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("post-trade reviewer"));
+    let user = request["messages"][1]["content"].as_str().unwrap();
+    assert!(user.contains("profit_factor") && user.contains("force_exit") && user.contains("突破"));
+    // The review is recorded next to the trading decisions, and a trading run never sees it.
+    let log = app.store.decisions(5).unwrap();
+    assert_eq!(log[0]["source"], "review");
+    assert_eq!(log[0]["analysis"], "3 笔样本，主动平仓亏损");
+    server.abort();
+    drop(app);
+    std::fs::remove_dir_all(dir).unwrap();
+}

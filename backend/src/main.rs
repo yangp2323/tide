@@ -8,6 +8,7 @@ mod knowledge_seed;
 mod mcp;
 mod migrate;
 mod model;
+mod review;
 mod store;
 #[cfg(test)]
 mod tests;

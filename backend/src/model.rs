@@ -82,6 +82,8 @@ pub struct AiConfig {
     pub max_consecutive_losses: u32,
     /// Analyse and record decisions on schedule without placing any order.
     pub shadow: bool,
+    /// Let the AI review its closed trades and keep its own observations in the knowledge base.
+    pub review: bool,
     /// Saved API channels. The model fields above always mirror the active one, so code that
     /// reads them (and an older build reading the same file) sees the channel in use.
     pub channels: Vec<Channel>,
@@ -194,6 +196,7 @@ impl Default for AiConfig {
             max_drawdown_pct: 20.0,
             max_consecutive_losses: 5,
             shadow: false,
+            review: true,
             channels: vec![],
             active_channel: String::new(),
         }

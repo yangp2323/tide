@@ -34,7 +34,7 @@ impl Store {
     fn seed_knowledge(&self) -> Result<()> {
         if self.state("knowledge_seed_v1")?.is_none() {
             for (title, content, source) in crate::knowledge_seed::SEEDS {
-                self.knowledge_add(title, content, source, true)?;
+                self.knowledge_add(title, content, source, true, "seed")?;
             }
             self.set_state("knowledge_seed_v1", "1")?;
         }
@@ -42,11 +42,12 @@ impl Store {
     }
     pub fn knowledge(&self) -> Result<Vec<Value>> {
         let db = self.db.lock().unwrap();
-        let mut q = db
-            .prepare("SELECT id,title,content,source,enabled,updated FROM knowledge ORDER BY id")?;
+        let mut q = db.prepare(
+            "SELECT id,title,content,source,enabled,updated,origin FROM knowledge ORDER BY id",
+        )?;
         let rows = q
             .query_map([], |r| {
-                Ok(json!({"id":r.get::<_,i64>(0)?,"title":r.get::<_,String>(1)?,"content":r.get::<_,String>(2)?,"source":r.get::<_,String>(3)?,"enabled":r.get::<_,i64>(4)? != 0,"updated":r.get::<_,String>(5)?}))
+                Ok(json!({"id":r.get::<_,i64>(0)?,"title":r.get::<_,String>(1)?,"content":r.get::<_,String>(2)?,"source":r.get::<_,String>(3)?,"enabled":r.get::<_,i64>(4)? != 0,"updated":r.get::<_,String>(5)?,"origin":r.get::<_,String>(6)?}))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
@@ -57,11 +58,12 @@ impl Store {
         content: &str,
         source: &str,
         enabled: bool,
+        origin: &str,
     ) -> Result<i64> {
         let db = self.db.lock().unwrap();
         db.execute(
-            "INSERT INTO knowledge(title,content,source,enabled,updated) VALUES (?,?,?,?,?)",
-            params![title, content, source, enabled as i64, now()],
+            "INSERT INTO knowledge(title,content,source,enabled,updated,origin) VALUES (?,?,?,?,?,?)",
+            params![title, content, source, enabled as i64, now(), origin],
         )?;
         Ok(db.last_insert_rowid())
     }
@@ -325,7 +327,7 @@ fn migrate_schema(db: &Connection) -> Result<()> {
     const STEPS: &[&str] = &[
         "CREATE INDEX IF NOT EXISTS trades_close ON trades(json_extract(data,'$.close_date'))",
         "CREATE TABLE IF NOT EXISTS stop_changes(id INTEGER PRIMARY KEY, time TEXT NOT NULL, trade_id INTEGER NOT NULL, pair TEXT NOT NULL, stop REAL NOT NULL, take_profit REAL NOT NULL, source TEXT NOT NULL)",
-        "CREATE TABLE IF NOT EXISTS knowledge(id INTEGER PRIMARY KEY, title TEXT NOT NULL, content TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, updated TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS knowledge(id INTEGER PRIMARY KEY, title TEXT NOT NULL, content TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, updated TEXT NOT NULL, origin TEXT NOT NULL DEFAULT 'user')",
     ];
     let version: usize = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     for (i, sql) in STEPS.iter().enumerate().skip(version) {
