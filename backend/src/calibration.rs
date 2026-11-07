@@ -12,6 +12,8 @@ use serde_json::{json, Value};
 pub const PRIOR_TRADES: f64 = 10.0;
 /// Taker fee per side assumed when judging an entry before it fills (Bybit standard tier).
 pub const TAKER_FEE: f64 = 0.00055;
+/// Exit reason of a position the operator closed by hand on the exchange.
+pub const EXTERNAL_CLOSE: &str = "external_close";
 /// Forecast ranges the calibration table reports on. The last bound is open so 1.0 fits.
 const BUCKETS: [(f64, f64); 5] = [(0.0, 0.4), (0.4, 0.5), (0.5, 0.6), (0.6, 0.7), (0.7, 1.01)];
 
@@ -52,9 +54,14 @@ fn bucket_of(p: f64) -> usize {
 
 impl Calibration {
     /// Closed trades that carry a forecast; a win is a trade that closed with a net profit.
+    /// A position the operator closed by hand on the exchange never reached the outcome the
+    /// forecast was about, so it does not count.
     pub fn from_trades(trades: &[Trade]) -> Self {
         let mut c = Self::default();
-        for t in trades.iter().filter(|t| t.close_date.is_some()) {
+        for t in trades
+            .iter()
+            .filter(|t| t.close_date.is_some() && t.exit_reason.as_deref() != Some(EXTERNAL_CLOSE))
+        {
             let Some(p) = t.win_prob.filter(|p| (0.0..=1.0).contains(p)) else {
                 continue;
             };
@@ -226,7 +233,10 @@ mod tests {
         open.close_date = None;
         let mut silent = closed(0.9, 1.0, 100.0, 102.0, 0.02);
         silent.win_prob = None;
-        assert_eq!(Calibration::from_trades(&[open, silent]).n, 0);
+        // Nor do positions the operator closed by hand.
+        let mut by_hand = closed(0.9, -1.0, 100.0, 99.0, 0.02);
+        by_hand.exit_reason = Some(EXTERNAL_CLOSE.into());
+        assert_eq!(Calibration::from_trades(&[open, silent, by_hand]).n, 0);
     }
 
     #[test]

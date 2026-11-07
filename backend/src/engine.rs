@@ -100,6 +100,55 @@ pub fn stop_ahead_of_liquidation(t: &Trade) -> bool {
     } / t.open_rate;
     loss_side.is_finite() && loss_side <= 0.6 / t.leverage.max(1) as f64 + 1e-9
 }
+/// Exit reason for a position closed on the exchange by something other than Tide's own
+/// orders, read from Bybit's closing fills. Tide's stops and take profits are position-level
+/// TP/SL, so their fills carry a StopLoss or TakeProfit origin; a close the operator makes by
+/// hand on the exchange is a plain order (`CreateByUser` or `CreateByClosing`). The reason
+/// covering the most quantity wins. Fills without origin fields fall back to which level the
+/// exit price sits nearer.
+pub fn external_exit_reason(fills: &[Value], t: &Trade, exit_price: f64) -> &'static str {
+    let origin = |e: &Value| {
+        let stop = e["stopOrderType"].as_str().unwrap_or("");
+        let create = e["createType"].as_str().unwrap_or("");
+        match (stop, create) {
+            ("StopLoss" | "PartialStopLoss" | "TrailingStop", _)
+            | (_, "CreateByStopLoss" | "CreateByPartialStopLoss" | "CreateByTrailingStop") => {
+                Some("stoploss_on_exchange")
+            }
+            ("TakeProfit" | "PartialTakeProfit", _)
+            | (_, "CreateByTakeProfit" | "CreateByPartialTakeProfit") => {
+                Some("take_profit_on_exchange")
+            }
+            (_, c) if c.starts_with("CreateByLiq") || c.starts_with("CreateByAdl") => {
+                Some("liquidation")
+            }
+            // A conditional order the operator placed, or a plain close by hand.
+            ("Stop", _) | (_, "CreateByUser" | "CreateByClosing") => {
+                Some(crate::calibration::EXTERNAL_CLOSE)
+            }
+            _ => None,
+        }
+    };
+    let mut by_reason: Vec<(&'static str, f64)> = vec![];
+    for e in fills {
+        if let Some(r) = origin(e) {
+            match by_reason.iter_mut().find(|(k, _)| *k == r) {
+                Some((_, q)) => *q += num(&e["closedSize"]),
+                None => by_reason.push((r, num(&e["closedSize"]))),
+            }
+        }
+    }
+    if let Some((r, _)) = by_reason.into_iter().max_by(|a, b| a.1.total_cmp(&b.1)) {
+        return r;
+    }
+    if t.take_profit_abs > 0.0
+        && (exit_price - t.take_profit_abs).abs() < (exit_price - t.stop_loss_abs).abs()
+    {
+        "take_profit_on_exchange"
+    } else {
+        "stoploss_on_exchange"
+    }
+}
 /// Share of the budget that may be committed as margin; the rest covers fees and slippage.
 pub const USABLE: f64 = 0.95;
 /// Funds new entries may draw on: what is free on the exchange, within the optional capital limit.
@@ -1368,14 +1417,7 @@ impl App {
             .sum();
         let fee: f64 = fills.iter().map(|e| num(&e["execFee"])).sum();
         let link = format!("external-{}", t.trade_id);
-        let exit_price = value / qty;
-        let reason = if t.take_profit_abs > 0.0
-            && (exit_price - t.take_profit_abs).abs() < (exit_price - t.stop_loss_abs).abs()
-        {
-            "take_profit_on_exchange"
-        } else {
-            "stoploss_on_exchange"
-        };
+        let reason = external_exit_reason(&fills, t, value / qty);
         let order = json!({"link":link,"action":"exit","data":{"trade":t,"reason":reason}});
         // This is an already confirmed external fill, not an outgoing order.
         // settle_exit records it atomically; no synthetic pending order can be
@@ -1711,6 +1753,56 @@ mod tests {
             win_prob: None,
             planned_rr: None,
         }
+    }
+    #[test]
+    fn exchange_closes_are_labelled_by_their_origin() {
+        let mut t = sample(true, 0.0);
+        t.stop_loss_abs = 105.0;
+        t.take_profit_abs = 90.0;
+        let fill = |qty: &str, stop: &str, create: &str| json!({"closedSize":qty,"stopOrderType":stop,"createType":create});
+        // The operator's market close in the Bybit app, near the stop's price or not.
+        let by_hand = [fill("1", "UNKNOWN", "CreateByClosing")];
+        assert_eq!(external_exit_reason(&by_hand, &t, 104.9), "external_close");
+        assert_eq!(
+            external_exit_reason(&[fill("1", "", "CreateByUser")], &t, 100.0),
+            "external_close"
+        );
+        // Position-level TP/SL fills, even where the price alone would say the other one.
+        assert_eq!(
+            external_exit_reason(&[fill("1", "StopLoss", "CreateByStopLoss")], &t, 91.0),
+            "stoploss_on_exchange"
+        );
+        assert_eq!(
+            external_exit_reason(&[fill("1", "UNKNOWN", "CreateByTrailingStop")], &t, 99.0),
+            "stoploss_on_exchange"
+        );
+        assert_eq!(
+            external_exit_reason(&[fill("1", "TakeProfit", "CreateByTakeProfit")], &t, 104.0),
+            "take_profit_on_exchange"
+        );
+        assert_eq!(
+            external_exit_reason(&[fill("1", "UNKNOWN", "CreateByLiq")], &t, 120.0),
+            "liquidation"
+        );
+        // Mixed fills: the reason covering more quantity wins.
+        let mixed = [
+            fill("0.3", "UNKNOWN", "CreateByClosing"),
+            fill("0.7", "PartialStopLoss", "CreateByPartialStopLoss"),
+        ];
+        assert_eq!(
+            external_exit_reason(&mixed, &t, 104.0),
+            "stoploss_on_exchange"
+        );
+        // No origin fields: the nearer level decides, as before.
+        let bare = [json!({"closedSize":"1"})];
+        assert_eq!(
+            external_exit_reason(&bare, &t, 91.0),
+            "take_profit_on_exchange"
+        );
+        assert_eq!(
+            external_exit_reason(&bare, &t, 104.0),
+            "stoploss_on_exchange"
+        );
     }
     #[test]
     fn trailing_floor_never_loosens_a_stop() {

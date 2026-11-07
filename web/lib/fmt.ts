@@ -37,6 +37,8 @@ export const WHY: Record<string, string> = {
   stoploss_on_exchange: "交易所止损",
   trailing_stop_loss: "移动止盈",
   force_exit: "手动或 AI 平仓",
+  external_close: "交易所手动平仓",
+  take_profit_on_exchange: "交易所止盈",
   roi: "止盈",
   liquidation: "爆仓",
 };
