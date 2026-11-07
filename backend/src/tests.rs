@@ -37,6 +37,17 @@ fn leverage_cap_is_25_for_futures_only() {
         cfg.leverage = leverage;
         assert!(api::validate(&cfg).is_err());
     }
+    // The minimum sits between 1x and the maximum.
+    cfg.leverage = 10;
+    for min in [1, 5, 10] {
+        cfg.min_leverage = min;
+        api::validate(&cfg).unwrap();
+    }
+    for min in [0, 11] {
+        cfg.min_leverage = min;
+        assert!(api::validate(&cfg).is_err());
+    }
+    cfg.min_leverage = 1;
     cfg.market = "spot".into();
     cfg.leverage = 25;
     assert!(api::validate(&cfg).is_err());
@@ -131,8 +142,7 @@ async fn execution_is_durable_and_closing_releases_position_slots() {
     // The exchange accepts 5 USDT; concurrent holdings, not past entries, limit trading.
     cfg.capital = Some(6.0);
     cfg.max_open = 1;
-    // 5% of 6 USDT at a 2.5% stop wants 12 USDT; the 95% budget cap limits it to 5.7.
-    cfg.risk_per_trade_pct = 5.0;
+    // Without a requested margin the single slot gets 95% of the 6 USDT budget: 5.7.
     api::validate(&cfg).unwrap();
     cfg.exchange = model::Credentials {
         key: "test".into(),
@@ -194,6 +204,26 @@ async fn execution_is_durable_and_closing_releases_position_slots() {
     assert!(app.store.open_trades().unwrap().is_empty());
     assert!(app.store.unresolved().unwrap().is_empty());
     assert_eq!(mock.lock().await.count, 2);
+    // The AI cannot abandon an entry within the minimum holding time; the operator can.
+    let result = app
+        .execute_actions(&[actions[0].clone()], false)
+        .await
+        .unwrap();
+    assert_eq!(result[0]["status"], "executed", "{}", result[0]);
+    let close = json!({"action":"close","pair":"BTC/USDT","confidence":0.9});
+    let result = app
+        .execute_actions(std::slice::from_ref(&close), false)
+        .await
+        .unwrap();
+    assert_eq!(result[0]["status"], "failed", "{}", result[0]);
+    assert!(result[0]["note"].as_str().unwrap().contains("set_stops"));
+    assert_eq!(app.store.open_trades().unwrap().len(), 1);
+    let result = app
+        .execute_actions(std::slice::from_ref(&close), true)
+        .await
+        .unwrap();
+    assert_eq!(result[0]["status"], "executed", "{}", result[0]);
+    assert!(app.store.open_trades().unwrap().is_empty());
     // Repeatedly reuse the same slot on the same day, including close + reopen in one batch.
     for _ in 0..3 {
         let result = app
@@ -201,6 +231,7 @@ async fn execution_is_durable_and_closing_releases_position_slots() {
             .await
             .unwrap();
         assert_eq!(result[0]["status"], "executed", "{}", result[0]);
+        age_open_trades(&app, model::MIN_HOLD_BEFORE_AI_CLOSE_MINUTES);
         // Close is processed before open even if the model lists open first.
         let result = app
             .execute_actions(
@@ -217,6 +248,7 @@ async fn execution_is_durable_and_closing_releases_position_slots() {
             "{:?}",
             result
         );
+        age_open_trades(&app, model::MIN_HOLD_BEFORE_AI_CLOSE_MINUTES);
         let result = app
             .execute_actions(&[json!({"action":"close","pair":"BTC/USDT"})], false)
             .await
@@ -235,7 +267,8 @@ async fn execution_is_durable_and_closing_releases_position_slots() {
     let status: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
     assert_eq!(status["position_count"], 0);
-    assert_eq!(mock.lock().await.count, 14);
+    // 2 for the first round trip, 2 for the held-back close, 4 for each of the 3 loops.
+    assert_eq!(mock.lock().await.count, 16);
     app.store
         .reserve("uncertain", "entry", "SOL/USDT", &json!({"trade":held[0]}))
         .unwrap();
@@ -266,7 +299,7 @@ async fn execution_is_durable_and_closing_releases_position_slots() {
     let remaining = app.store.open_trades().unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].market, "futures");
-    assert_eq!(mock.lock().await.count, 15);
+    assert_eq!(mock.lock().await.count, 17);
     assert!(!app.store.state("risk_error").unwrap().unwrap().is_empty());
     // Test the actual HTTP authentication / origin middleware without any live exchange traffic.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -780,6 +813,17 @@ async fn sim_app(
     });
     (app, dir, server)
 }
+/// Moves every open trade's opening time back, as if it had been held for `minutes`.
+fn age_open_trades(app: &App, minutes: i64) {
+    let opened = (chrono::Utc::now() - chrono::Duration::minutes(minutes))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    for mut t in app.store.open_trades().unwrap() {
+        t.open_date = opened.clone();
+        app.store.update_trade(&t).unwrap();
+    }
+}
+
 fn open_long(pair: &str) -> Value {
     json!({"action":"open_long","pair":pair,"confidence":0.9,"reason":"突破后回踩确认","stop_loss_pct":4.0,"take_profit_pct":8.0})
 }
@@ -797,14 +841,13 @@ async fn futures_stops_follow_ai_trail_and_external_take_profit() {
         pairs: vec!["BTC/USDT:USDT".into()],
         leverage: 5,
         short: true,
-        risk_per_trade_pct: 1.0,
         ..model::Config::default()
     };
     let (app, dir, server) = sim_app(&sim, cfg).await;
-    let result = app
-        .execute_actions(&[open_long("BTC/USDT:USDT")], false)
-        .await
-        .unwrap();
+    // 50 USDT of margin at 5x is a 250 USDT position: 25 contracts at 10.
+    let mut action = open_long("BTC/USDT:USDT");
+    action["margin_usdt"] = json!(50);
+    let result = app.execute_actions(&[action], false).await.unwrap();
     assert_eq!(result[0]["status"], "executed", "{}", result[0]);
     let t = app.store.open_trades().unwrap().remove(0);
     assert!((t.stop_loss_abs - 9.6).abs() < 1e-9 && (t.take_profit_abs - 10.8).abs() < 1e-9);
@@ -828,6 +871,10 @@ async fn futures_stops_follow_ai_trail_and_external_take_profit() {
         .unwrap();
     let snap = app.snapshot().await.unwrap();
     assert_eq!(snap["open_positions"][0]["entry_reason"], "突破后回踩确认");
+    // Just opened: the model sees how long it has held the position.
+    assert!(snap["open_positions"][0]["held_minutes"].as_i64().unwrap() < 2);
+    assert_eq!(snap["exit_performance"]["sample_trades"], 0);
+    assert!(snap["exit_performance"]["by_exit_reason"].is_object());
     assert_eq!(snap["open_positions"][0]["leverage"], 5);
     assert_eq!(snap["pairs"][0]["market_stats"]["last_price"], 10.0);
     assert_eq!(snap["pairs"][0]["forming_4h_candle"]["high_so_far"], 10.4);
@@ -860,7 +907,16 @@ async fn futures_stops_follow_ai_trail_and_external_take_profit() {
     ] {
         assert!(!text.contains(hidden), "{hidden}");
     }
-    assert!(snap["trade_limits"]["max_risk_per_trade_pct"].is_number());
+    // The model allocates capital itself: it sees what it can commit, and no per-trade cap.
+    assert!(!text.contains("max_risk_per_trade_pct"));
+    // One open position holds 50 USDT of margin; the simulated wallet still reports 1000 free.
+    assert!((snap["trade_limits"]["allocatable_usdt"].as_f64().unwrap() - 950.0).abs() < 1e-9);
+    // A 5 USDT minimum at the safe leverage (capped at the configured 5x) needs 1 USDT of margin.
+    assert_eq!(snap["pairs"][0]["sizing"]["min_order_usdt"], 5.0);
+    assert_eq!(
+        snap["pairs"][0]["sizing"]["min_margin_usdt_at_safe_leverage"],
+        1.0
+    );
     assert!(snap["daily_profit_target"].is_null());
     let mut config = app.store.config().unwrap();
     config.ai.daily_profit_target_pct = 2.0;
@@ -965,7 +1021,7 @@ async fn futures_stops_follow_ai_trail_and_external_take_profit() {
 }
 
 #[tokio::test]
-async fn ai_chooses_risk_and_leverage_within_the_limits() {
+async fn ai_allocates_margin_and_leverage_within_the_limits() {
     let _env = EXCHANGE.lock().await;
     let sim = Arc::new(Mutex::new(Sim {
         futures: true,
@@ -977,13 +1033,12 @@ async fn ai_chooses_risk_and_leverage_within_the_limits() {
         pairs: vec!["BTC/USDT:USDT".into()],
         leverage: 5,
         short: true,
-        risk_per_trade_pct: 1.0,
         ..model::Config::default()
     };
     let (app, dir, server) = sim_app(&sim, cfg).await;
-    // 0.6% risk at a 4% stop is 150 notional: 75 margin at 2x.
+    // 75 USDT of margin at 2x is 150 notional: 15 contracts at 10.
     let mut action = open_long("BTC/USDT:USDT");
-    action["risk_pct"] = json!(0.6);
+    action["margin_usdt"] = json!(75);
     action["leverage"] = json!(2);
     let result = app.execute_actions(&[action], false).await.unwrap();
     assert_eq!(result[0]["status"], "executed", "{}", result[0]);
@@ -994,27 +1049,73 @@ async fn ai_chooses_risk_and_leverage_within_the_limits() {
         let _lock = app.gate.lock().await;
         app.close_position(t.trade_id, "force_exit").await.unwrap();
     }
-    // Asking for more than the limits allows is lowered to them, not refused:
-    // risk to the 1% cap, leverage to the configured 5x.
+    // Asking for more than the limits allows is lowered to them, not refused: margin to 95%
+    // of the 1000 free, leverage to the configured 5x. 950 × 5 at 10 is 475 contracts.
     let mut action = open_long("BTC/USDT:USDT");
-    action["risk_pct"] = json!(9.0);
+    action["margin_usdt"] = json!(5000);
     action["leverage"] = json!(50);
     let result = app.execute_actions(&[action], false).await.unwrap();
     assert_eq!(result[0]["status"], "executed", "{}", result[0]);
     let t = app.store.open_trades().unwrap().remove(0);
     assert_eq!(t.leverage, 5);
-    assert!((t.amount - 25.0).abs() < 1e-9, "{}", t.amount);
+    assert!((t.amount - 475.0).abs() < 1e-9, "{}", t.amount);
     {
         let _lock = app.gate.lock().await;
         app.close_position(t.trade_id, "force_exit").await.unwrap();
     }
+    // Without a margin the free funds are split over the 5 slots: 190 × 5 at 10 is 95.
+    let result = app
+        .execute_actions(&[open_long("BTC/USDT:USDT")], false)
+        .await
+        .unwrap();
+    assert_eq!(result[0]["status"], "executed", "{}", result[0]);
+    let t = app.store.open_trades().unwrap().remove(0);
+    assert!((t.amount - 95.0).abs() < 1e-9, "{}", t.amount);
+    {
+        let _lock = app.gate.lock().await;
+        app.close_position(t.trade_id, "force_exit").await.unwrap();
+    }
+    // The operator's minimum leverage raises a lower request: 2x becomes 3x.
+    let mut config = app.store.config().unwrap();
+    config.min_leverage = 3;
+    app.store.save_config(&config).unwrap();
+    let mut action = open_long("BTC/USDT:USDT");
+    action["margin_usdt"] = json!(10);
+    action["leverage"] = json!(2);
+    let result = app.execute_actions(&[action], false).await.unwrap();
+    assert_eq!(result[0]["status"], "executed", "{}", result[0]);
+    let t = app.store.open_trades().unwrap().remove(0);
+    assert_eq!(t.leverage, 3);
+    assert!((t.amount - 3.0).abs() < 1e-9, "{}", t.amount);
+    assert_eq!(
+        app.snapshot().await.unwrap()["trade_limits"]["min_leverage"],
+        3
+    );
+    {
+        let _lock = app.gate.lock().await;
+        app.close_position(t.trade_id, "force_exit").await.unwrap();
+    }
+    config.min_leverage = 1;
+    app.store.save_config(&config).unwrap();
+    // Below the exchange minimum (5 USDT of position) is refused with the margin it needs.
+    let mut action = open_long("BTC/USDT:USDT");
+    action["margin_usdt"] = json!(0.5);
+    action["leverage"] = json!(5);
+    let result = app.execute_actions(&[action], false).await.unwrap();
+    assert_eq!(result[0]["status"], "failed", "{}", result[0]);
+    assert!(
+        result[0]["note"].as_str().unwrap().contains("最小下单额"),
+        "{}",
+        result[0]
+    );
     // Nonsense values are rejected before any order is sent.
     let orders = sim.lock().await.count;
     for bad in [
         json!({"leverage":2.5}),
         json!({"leverage":0}),
-        json!({"risk_pct":-1}),
-        json!({"risk_pct":"1"}),
+        json!({"margin_usdt":-1}),
+        json!({"margin_usdt":0}),
+        json!({"margin_usdt":"1"}),
     ] {
         let mut action = open_long("BTC/USDT:USDT");
         for (k, v) in bad.as_object().unwrap() {
@@ -1281,8 +1382,8 @@ fn existing_config_moves_to_ai_managed_limits_once() {
     .unwrap();
     let store = store::Store::open(&dir).unwrap();
     let c = store.config().unwrap();
+    // The retired per-trade risk setting in old files is ignored, not an error.
     assert_eq!(c.max_open, model::MAX_OPEN);
-    assert_eq!(c.risk_per_trade_pct, model::MAX_RISK_PER_TRADE_PCT);
     assert_eq!(c.max_same_direction, 0);
     assert!(c.short);
     assert_eq!(c.leverage, 10);
@@ -1498,15 +1599,14 @@ async fn open_trades_raise_hook_events_as_they_move() {
         pairs: vec!["BTC/USDT:USDT".into()],
         leverage: 5,
         short: true,
-        risk_per_trade_pct: 1.0,
         ..model::Config::default()
     };
     cfg.ai.hooks.big_move_pct = 0.0;
     let (app, dir, server) = sim_app(&sim, cfg).await;
-    let result = app
-        .execute_actions(&[open_long("BTC/USDT:USDT")], false)
-        .await
-        .unwrap();
+    // 50 USDT at 5x: the 25 contracts the simulated exchange fill below closes.
+    let mut action = open_long("BTC/USDT:USDT");
+    action["margin_usdt"] = json!(50);
+    let result = app.execute_actions(&[action], false).await.unwrap();
     assert_eq!(result[0]["status"], "executed", "{}", result[0]);
     let tick = || async {
         let _lock = app.gate.lock().await;

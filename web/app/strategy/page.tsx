@@ -8,7 +8,7 @@ import AiControls from "@/components/AiControls";
 import { Card, Empty, MsgBox, Skeleton, useAction } from "@/lib/ui";
 
 type Market = "spot" | "futures";
-type Draft = { market: Market; leverage: number; pairs: string[] };
+type Draft = { market: Market; leverage: number; min_leverage: number; pairs: string[] };
 type Row = {
   pair: string;
   base: string;
@@ -38,9 +38,10 @@ export default function StrategyPage() {
     () => ({
       market: d.market === "futures" ? "futures" : "spot",
       leverage: d.leverage ?? 1,
+      min_leverage: d.min_leverage ?? 1,
       pairs: d.pairs ?? [],
     }),
-    [d.market, d.leverage, d.pairs],
+    [d.market, d.leverage, d.min_leverage, d.pairs],
   );
 
   const savedRef = useRef(saved);
@@ -51,7 +52,6 @@ export default function StrategyPage() {
   const maxPairs = d.max_pairs ?? 12;
   const maxLev = d.max_leverage ?? 25;
   const openCap = d.max_open_limit ?? 5;
-  const riskCap = d.risk_per_trade_pct ?? 2;
   // 止损由 AI 给出（默认参考 2.5×ATR），限制在 2%–10%；系统按止损距离逐笔下调杠杆，使止损不超过强平距离的 60%。
   const stopLo = 0.02;
   const stopHi = 0.1;
@@ -119,9 +119,14 @@ export default function StrategyPage() {
       const next: Draft = { ...from, ...ch };
       if (ch.market && ch.market !== from.market) {
         next.pairs = from.pairs.map(ch.market === "futures" ? toFutures : toSpot);
-        if (ch.market === "spot") next.leverage = 1;
+        if (ch.market === "spot") {
+          next.leverage = 1;
+          next.min_leverage = 1;
+        }
       }
       next.leverage = clamp(next.leverage || 1, 1, maxLev);
+      // 最低杠杆不能高于最高杠杆：调低上限时一起压下来
+      next.min_leverage = clamp(next.min_leverage || 1, 1, next.leverage);
       return next;
     });
   }
@@ -136,7 +141,9 @@ export default function StrategyPage() {
     const b = cur;
     const out: string[] = [];
     if (a.market !== b.market) out.push(b.market === "futures" ? "改成合约" : "改成现货");
-    if (a.leverage !== b.leverage && b.market === "futures") out.push(`杠杆 ${a.leverage}× → ${b.leverage}×`);
+    if (a.leverage !== b.leverage && b.market === "futures") out.push(`最高杠杆 ${a.leverage}× → ${b.leverage}×`);
+    if (a.min_leverage !== b.min_leverage && b.market === "futures")
+      out.push(`最低杠杆 ${a.min_leverage}× → ${b.min_leverage}×`);
     if (a.market === b.market) {
       const sa = new Set(a.pairs);
       const sb = new Set(b.pairs);
@@ -165,7 +172,7 @@ export default function StrategyPage() {
     if (fut && cur.leverage >= 5) {
       const ok = await confirm({
         title: `确定用最高 ${cur.leverage} 倍杠杆？`,
-        body: `AI 在这个上限内选择杠杆，每笔最多亏总资金的 ${riskCap}%、同时最多 ${openCap} 笔（不含费用和滑点）。杠杆只影响占用的保证金，系统还会按止损距离下调，保证止损先于强平。`,
+        body: `AI 在 ${cur.min_leverage}×–${cur.leverage}× 之间选择杠杆，并自行决定每笔投入多少可用资金、同时最多 ${openCap} 笔。单笔没有亏损上限：仓位 = 投入的保证金 × 杠杆，止损时亏损约为仓位 × 止损距离。系统会按止损距离下调杠杆，保证止损先于强平。`,
         ok: "确定",
         danger: true,
       });
@@ -231,7 +238,7 @@ export default function StrategyPage() {
           </div>
 
           <div className={"field lev" + (fut ? "" : " off")}>
-            <b>杠杆</b>
+            <b>最高杠杆</b>
             <div className="lev-top">
               <b>{cur.leverage}×</b>
               <span>
@@ -254,6 +261,31 @@ export default function StrategyPage() {
               <span>{Math.round(maxLev * 2 / 3)}×</span>
               <span>{maxLev}×</span>
             </div>
+            <b style={{ display: "block", marginTop: 16 }}>最低杠杆</b>
+            <div className="lev-top">
+              <b>{cur.min_leverage}×</b>
+              <span>
+                {!fut
+                  ? "现货没有杠杆"
+                  : cur.min_leverage === 1
+                    ? "不设下限"
+                    : "AI 选的杠杆低于它会被抬高；止损较宽、安全杠杆更低时以安全值为准"}
+              </span>
+            </div>
+            <input
+              type="range"
+              min={1}
+              max={Math.max(cur.leverage, 1)}
+              step={1}
+              value={cur.min_leverage}
+              disabled={!fut || cur.leverage <= 1}
+              aria-label="最低杠杆倍数"
+              onChange={(e) => update({ min_leverage: +e.target.value })}
+            />
+            <div className="lev-ticks">
+              <span>1×</span>
+              <span>{cur.leverage}×</span>
+            </div>
             <div className="risk">
               <div>
                 <span>实际杠杆（止损 2% → 10%）</span>
@@ -269,7 +301,7 @@ export default function StrategyPage() {
           <div className="field">
             <b>方向和仓位</b>
             <p>
-              {fut ? "做多还是做空、同时持有几笔、每笔冒多大风险，都由 AI 根据行情和账户情况决定，没有开关。" : "现货只能做多。同时持有几笔、每笔冒多大风险，由 AI 根据行情和账户情况决定，没有开关。"}
+              {fut ? "做多还是做空、同时持有几笔、每笔投入多少可用资金，都由 AI 根据行情灵活分配，没有开关。" : "现货只能做多。同时持有几笔、每笔投入多少可用资金，由 AI 根据行情灵活分配，没有开关。"}
             </p>
             <div className="risk" style={{ marginTop: 12 }}>
               <div>
@@ -277,8 +309,8 @@ export default function StrategyPage() {
                 <b>{openCap} 笔</b>
               </div>
               <div>
-                <span>每笔最多亏（系统上限）</span>
-                <b>{riskCap}% 总资金</b>
+                <span>每笔可投入</span>
+                <b>最多可用资金的 95%，单笔不设亏损上限</b>
               </div>
             </div>
             <p>AI 看到每个币的最小下单额，资金不够的币不会提出开仓。当日亏损、回撤和连续亏损这些账户级保护在本页的风控保护里设置，触发后会停止开仓。</p>

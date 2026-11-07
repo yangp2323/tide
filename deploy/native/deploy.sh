@@ -24,8 +24,14 @@ if test "$(git rev-parse HEAD)" != "$(git rev-parse '@{u}')"; then
 fi
 
 mkdir -p dist
-exec 8>dist/deploy.lock
-flock -n 8 || { echo 'Another local deployment is running'; exit 1; }
+if command -v flock >/dev/null; then
+  exec 8>dist/deploy.lock
+  flock -n 8 || { echo 'Another local deployment is running'; exit 1; }
+else
+  # macOS has no flock; creating a directory is atomic. A killed run leaves it behind.
+  mkdir dist/deploy.lock.d 2>/dev/null || { echo 'Another local deployment is running (remove dist/deploy.lock.d if not)'; exit 1; }
+  trap 'rmdir dist/deploy.lock.d' EXIT
+fi
 
 ssh_cmd=${DEPLOY_SSH:-ssh}
 scp_cmd=${DEPLOY_SCP:-scp}

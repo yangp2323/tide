@@ -12,7 +12,9 @@ make depoly
 
 `make deploy` 是同一个命令的别名。默认使用 SSH 配置中的 `s-tokyo`，也可运行 `make depoly DEPLOY_HOST=其他SSH别名`。需要免交互 SSH 登录和远端 root 权限。主机别名只配置在 Windows 时，WSL 会自动使用 Windows OpenSSH，复用 Windows 的主机别名和密钥。
 
-构建需要 make、Python 3（仅运行部署测试）、Rust（`rust-toolchain.toml`）、musl 工具链、Node.js（`.nvmrc`）和 Corepack/pnpm；使用 nvm 时先运行 `nvm install`，之后脚本会自动加载项目指定的 Node 版本。服务器需要已完成原生安装、sqlite3 和 flock。本命令不负责首次初始化或旧版迁移。
+macOS 也可以直接运行：构建自动改用 `cargo zigbuild` 交叉编译（需要 `cargo install cargo-zigbuild` 和 `brew install zig`），打包时不带 macOS 扩展属性；本机没有 flock 时用目录锁防止并发部署（异常退出后如提示已在部署，删除 `dist/deploy.lock.d`）。服务器升级脚本的测试 `test_upgrade.py` 依赖 Linux 工具，在 macOS 上会跳过。
+
+构建需要 make、Python 3（仅运行部署测试）、Rust（`rust-toolchain.toml`）、musl 工具链（macOS 用 zig 代替）、Node.js（`.nvmrc`）和 Corepack/pnpm；使用 nvm 时先运行 `nvm install`，之后脚本会自动加载项目指定的 Node 版本。服务器需要已完成原生安装、sqlite3 和 flock。本命令不负责首次初始化或旧版迁移。
 
 脚本会依次执行格式检查、后端测试、锁定依赖构建、前端类型检查和构建，生成全新的发布包并校验上传内容。服务器加锁后，将配置、登录凭据、环境文件和 SQLite 一致性备份保存到 `/opt/tide/backups/<版本>`，校验发布包，原子切换版本并重启 Tide。随后检查实际运行的二进制、本机与公网健康接口以及页面访问。
 

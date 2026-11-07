@@ -119,12 +119,12 @@ pub fn validate(c: &Config) -> Result<()> {
     ensure!((1..=5).contains(&c.max_open), "持仓数在 1 到 5 之间");
     ensure!((1..=25).contains(&c.leverage), "杠杆在 1 到 25 之间");
     ensure!(
-        c.market == "futures" || c.leverage == 1 && !c.short,
+        c.market == "futures" || c.leverage == 1 && c.min_leverage == 1 && !c.short,
         "现货不能加杠杆或做空"
     );
     ensure!(
-        c.risk_per_trade_pct.is_finite() && (0.1..=5.0).contains(&c.risk_per_trade_pct),
-        "每笔风险在 0.1% 到 5% 之间"
+        (1..=c.leverage).contains(&c.min_leverage),
+        "最低杠杆在 1 倍到最高杠杆之间"
     );
     ensure!(c.max_same_direction <= 5, "同方向持仓上限在 0 到 5 之间");
     ensure!(
@@ -343,15 +343,22 @@ async fn handle(
                 .collect();
             new.pairs.sort();
             new.pairs.dedup();
-            // Direction, position count and per-trade risk are the AI's decisions; the
-            // system only keeps its hard limits.
+            // Direction, position count and how much capital each trade gets are the AI's
+            // decisions; the system only keeps its hard limits.
             new.max_open = crate::model::MAX_OPEN;
-            new.risk_per_trade_pct = crate::model::MAX_RISK_PER_TRADE_PCT;
             new.max_same_direction = 0;
             new.leverage = if new.market == "spot" {
                 1
             } else {
                 body["leverage"].as_u64().context("杠杆无效")? as u32
+            };
+            // Only new entries use the floor, so it can change while positions are open.
+            new.min_leverage = if new.market == "spot" {
+                1
+            } else if body["min_leverage"].is_null() {
+                c.min_leverage
+            } else {
+                body["min_leverage"].as_u64().context("最低杠杆无效")? as u32
             };
             new.short = new.market == "futures";
             validate(&new)?;
@@ -699,7 +706,7 @@ pub async fn overview(app: &App) -> Result<Value> {
             json!({"date":day,"abs_profit":daily.get(&day).copied().unwrap_or(0.0)})
         })
         .collect();
-    let mut out = json!({"engine":"rust","server_ip":std::env::var("SERVER_IP").unwrap_or_default(),"key":mask(&c.exchange.key),"telegram":c.telegram.enabled,"capital":c.capital,"market":c.market,"leverage":c.leverage,"short":c.short,"pairs":c.pairs,"max_open":c.max_open,"max_pairs":12,"max_open_limit":5,"max_leverage":25,"risk_per_trade_pct":c.risk_per_trade_pct,"max_same_direction":c.max_same_direction,"stop_rule":"AI 设置，2%–10%","ai":c.ai.enabled,"state":if c.running{"running"}else{"stopped"},"strategy":"AI","timeframe":"4h","open":[],"watch":[],"daily":days,"recent":closed.iter().take(5).collect::<Vec<_>>(),"profit":{"profit_closed_coin":profit,"profit_closed_ratio_mean":if closed.is_empty(){0.0}else{closed.iter().map(|t|t.profit_ratio).sum::<f64>()/closed.len() as f64},"closed_trade_count":closed.len(),"winning_trades":closed.iter().filter(|t|t.profit_abs>0.0).count(),"losing_trades":closed.iter().filter(|t|t.profit_abs<=0.0).count()}});
+    let mut out = json!({"engine":"rust","server_ip":std::env::var("SERVER_IP").unwrap_or_default(),"key":mask(&c.exchange.key),"telegram":c.telegram.enabled,"capital":c.capital,"market":c.market,"leverage":c.leverage,"min_leverage":c.min_leverage,"short":c.short,"pairs":c.pairs,"max_open":c.max_open,"max_pairs":12,"max_open_limit":5,"max_leverage":25,"max_same_direction":c.max_same_direction,"stop_rule":"AI 设置，2%–10%","ai":c.ai.enabled,"state":if c.running{"running"}else{"stopped"},"strategy":"AI","timeframe":"4h","open":[],"watch":[],"daily":days,"recent":closed.iter().take(5).collect::<Vec<_>>(),"profit":{"profit_closed_coin":profit,"profit_closed_ratio_mean":if closed.is_empty(){0.0}else{closed.iter().map(|t|t.profit_ratio).sum::<f64>()/closed.len() as f64},"closed_trade_count":closed.len(),"winning_trades":closed.iter().filter(|t|t.profit_abs>0.0).count(),"losing_trades":closed.iter().filter(|t|t.profit_abs<=0.0).count()}});
     let result:Result<()> =async {
         let ticks=ex.tickers(&c.market).await?;let mut open=vec![];for t in &held{let p=ticks["list"].as_array().and_then(|a|a.iter().find(|p|p["symbol"]==symbol(&t.pair))).context("持仓行情缺失")?;open.push(t.mark(num(&p["lastPrice"])));}
         out["open"]=json!(open);

@@ -33,7 +33,7 @@ pub const SEEDS: &[(&str, &str, &str)] = &[
         "先判断行情状态，再决定用什么打法。\n\
          - ADX 低于约 20 通常表示没有明显趋势，高于 25–30 表示趋势成形；布林带宽度低于其 50 根均值的约 0.8 倍偏向震荡。两个信号同时一致时更可靠。\n\
          - 这些指标都有滞后，阈值只是常用经验值。\n\
-         - 震荡市里趋势类开仓容易被来回打：可以观望，或把仓位（risk_pct）调小，而不是硬做。",
+         - 震荡市里趋势类开仓容易被来回打：可以观望，或把投入的保证金（margin_usdt）调小，而不是硬做。",
         "https://equitiesindia.com/glossary/market-regime-detection ; https://de.tradingview.com/script/Syv6Sd57-BB-Breakout-Momentum-Reversion-Strategies",
     ),
     (

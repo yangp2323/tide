@@ -115,7 +115,6 @@ impl Store {
             if self.dir.join("config.json").exists() {
                 let mut c = self.config()?;
                 c.max_open = crate::model::MAX_OPEN;
-                c.risk_per_trade_pct = crate::model::MAX_RISK_PER_TRADE_PCT;
                 c.max_same_direction = 0;
                 c.short = c.market == "futures";
                 self.save_config(&c)?;

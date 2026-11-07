@@ -59,12 +59,32 @@ pub fn entry_guard(
     }
     Ok(())
 }
+/// Share of the budget that may be committed as margin; the rest covers fees and slippage.
+pub const USABLE: f64 = 0.95;
+/// Funds new entries may draw on: what is free on the exchange, within the optional capital limit.
+pub fn trade_budget(capital: Option<f64>, used: f64, free: f64) -> f64 {
+    capital.map_or(free, |cap| (cap - used).max(0.0).min(free))
+}
+/// Margin for a new entry: the AI's requested amount lowered to what may be committed, or,
+/// without a request, an even split over the slots that can still be afforded.
+pub fn entry_margin(
+    requested: Option<f64>,
+    budget: f64,
+    slots: usize,
+    minimum: f64,
+) -> Option<f64> {
+    match requested {
+        Some(m) if budget.is_finite() && budget > 0.0 => Some(m.min(budget * USABLE)),
+        Some(_) => None,
+        None => entry_stake(budget, slots, minimum),
+    }
+}
 /// Position slots are an upper bound; reserve 5% and divide only among affordable slots.
 pub fn entry_stake(budget: f64, slots: usize, minimum: f64) -> Option<f64> {
     if !budget.is_finite() || budget <= 0.0 || slots == 0 || !minimum.is_finite() || minimum < 0.0 {
         return None;
     }
-    let usable = budget * 0.95;
+    let usable = budget * USABLE;
     let affordable = if minimum > 0.0 {
         ((usable / minimum).floor() as usize).min(slots)
     } else {
@@ -86,6 +106,33 @@ pub fn stop_distance(atr: f64, price: f64) -> Option<f64> {
 pub fn trade_leverage(max: u32, stop: f64) -> u32 {
     ((0.6 / stop + 1e-9).floor() as u32).clamp(1, max.max(1))
 }
+/// Leverage for an entry: the AI's request (or the safety limit when it has none), kept between
+/// the configured floor and `allowed`. When the stop's safety limit is below the floor, the safety
+/// limit wins so the stop still triggers before liquidation.
+pub fn entry_leverage(requested: Option<u32>, floor: u32, allowed: u32) -> u32 {
+    let allowed = allowed.max(1);
+    requested
+        .unwrap_or(allowed)
+        .clamp(floor.clamp(1, allowed), allowed)
+}
+/// Whole minutes since `open_date` (UTC, as stored), or None if it cannot be read.
+pub fn held_minutes(open_date: &str, now: chrono::NaiveDateTime) -> Option<i64> {
+    let open = chrono::NaiveDateTime::parse_from_str(open_date, "%Y-%m-%d %H:%M:%S").ok()?;
+    Some((now - open).num_minutes())
+}
+/// The AI's own close waits for the minimum holding time. An unreadable open time does not
+/// block it, so a damaged record can still be closed.
+pub fn ai_close_guard(open_date: &str, now: chrono::NaiveDateTime) -> Result<()> {
+    let min = crate::model::MIN_HOLD_BEFORE_AI_CLOSE_MINUTES;
+    match held_minutes(open_date, now) {
+        Some(m) if m < min => bail!(
+            "开仓才 {} 分钟，不足 {} 分钟，AI 不能主动平仓；止损照常生效，可用 set_stops 收紧止损",
+            m.max(0),
+            min
+        ),
+        _ => Ok(()),
+    }
+}
 /// Per-trade leverage ceiling: the configured maximum, but never above the symbol's own limit
 /// (which can be fractional, e.g. 12.5×).
 pub fn leverage_cap(configured: u32, symbol_max: f64) -> u32 {
@@ -95,17 +142,14 @@ pub fn leverage_cap(configured: u32, symbol_max: f64) -> u32 {
         1
     }
 }
-/// Margin that loses `risk_pct` percent of `equity` if the stop is hit (before fees and slippage).
-pub fn risk_stake(equity: f64, risk_pct: f64, stop: f64, leverage: u32) -> f64 {
-    equity * risk_pct / 100.0 / stop / leverage as f64
-}
 /// Stop-loss and take-profit the AI asks for when opening, as percentages of the entry price.
 #[derive(Clone, Default)]
 pub struct Stops {
     pub stop_pct: Option<f64>,
     pub take_profit_pct: Option<f64>,
-    /// Percent of equity lost if the stop is hit; capped by the configured per-trade risk.
-    pub risk_pct: Option<f64>,
+    /// Margin in USDT the AI commits to this entry; lowered to what may still be committed.
+    /// The position is this margin times the leverage, and there is no per-trade loss cap.
+    pub margin_usdt: Option<f64>,
     /// Requested leverage; lowered to the symbol limit and to what keeps the stop ahead of liquidation.
     pub leverage: Option<u32>,
     /// The AI's reason for opening, kept on the trade.
@@ -498,11 +542,7 @@ impl App {
         let ins = ex.instrument(&c.market, pair).await?;
         let price = ex.price(&c.market, pair).await?;
         let used: f64 = held.iter().map(|t| t.stake_amount).sum();
-        let budget = if let Some(cap) = c.capital {
-            (cap - used).max(0.0).min(free)
-        } else {
-            free
-        };
+        let budget = trade_budget(c.capital, used, free);
         let futures = c.market == "futures";
         let stop = match stops.stop_pct {
             Some(pct) => requested_stop(pct)?,
@@ -523,17 +563,13 @@ impl App {
                 leverage_cap(c.leverage, num(&ins["leverageFilter"]["maxLeverage"])),
                 stop,
             );
-            stops.leverage.map_or(allowed, |l| l.clamp(1, allowed))
+            entry_leverage(stops.leverage, c.min_leverage, allowed)
         } else {
             1
         };
-        let risk_pct = match stops.risk_pct {
-            Some(r) => {
-                ensure!(r.is_finite() && r > 0.0, "风险百分比无效");
-                r.min(c.risk_per_trade_pct)
-            }
-            None => c.risk_per_trade_pct,
-        };
+        if let Some(m) = stops.margin_usdt {
+            ensure!(m.is_finite() && m > 0.0, "保证金金额无效");
+        }
         if futures {
             let account = ex.get("/v5/account/info", json!({}), true).await?;
             ensure!(
@@ -586,18 +622,20 @@ impl App {
         let min_stake = min_order_notional(&ins, futures, price)
             .context("交易所价格或下单精度无效")?
             / leverage as f64;
-        let cap = entry_stake(budget, c.max_open - held.len(), min_stake)
-            .context("可用预算预留 5% 后不足该交易对的最小下单要求")?;
-        let base = c.capital.map_or(equity, |cap| cap.min(equity));
-        let wanted = risk_stake(base, risk_pct, stop, leverage);
+        let stake = entry_margin(
+            stops.margin_usdt,
+            budget,
+            c.max_open - held.len(),
+            min_stake,
+        )
+        .context("可用预算预留 5% 后不足该交易对的最小下单要求")?;
         ensure!(
-            wanted.is_finite() && wanted >= min_stake,
-            "按每笔 {}% 风险、{:.1}% 止损、{} 倍杠杆计算的仓位低于交易所最小下单额",
-            risk_pct,
-            stop * 100.0,
-            leverage
+            stake.is_finite() && stake >= min_stake,
+            "按 {:.2} USDT 保证金、{} 倍杠杆计算的仓位低于交易所最小下单额（至少需要 {:.2} USDT 保证金）",
+            stake,
+            leverage,
+            min_stake
         );
-        let stake = wanted.min(cap);
         let qty = quantize(stake * leverage as f64 / price, step)?;
         let amount: f64 = qty.parse()?;
         ensure!(
@@ -1236,10 +1274,44 @@ mod tests {
     }
 
     #[test]
-    fn risk_sizing_and_daily_loss_include_floating_losses() {
-        // 1% of 1000 at a 5% stop is 200 notional: 200 margin at 1×, 40 at 5×.
-        assert!((risk_stake(1000.0, 1.0, 0.05, 1) - 200.0).abs() < 1e-9);
-        assert!((risk_stake(1000.0, 1.0, 0.05, 5) - 40.0).abs() < 1e-9);
+    fn ai_closes_wait_for_the_minimum_holding_time() {
+        let at = |s: &str| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap();
+        let open = "2026-11-04 00:37:00";
+        assert_eq!(held_minutes(open, at("2026-11-04 00:45:30")), Some(8));
+        assert!(ai_close_guard(open, at("2026-11-04 00:45:30")).is_err());
+        assert!(ai_close_guard(open, at("2026-11-04 01:36:59")).is_err());
+        assert!(ai_close_guard(open, at("2026-11-04 01:37:00")).is_ok());
+        // A clock behind the open time still waits; an unreadable time does not block.
+        assert!(ai_close_guard(open, at("2026-11-04 00:30:00")).is_err());
+        assert!(ai_close_guard("", at("2026-11-04 00:30:00")).is_ok());
+    }
+
+    #[test]
+    fn leverage_stays_between_the_floor_and_the_safety_limit() {
+        // A request inside the range is kept; below the floor it is raised, above it lowered.
+        assert_eq!(entry_leverage(Some(5), 3, 10), 5);
+        assert_eq!(entry_leverage(Some(2), 3, 10), 3);
+        assert_eq!(entry_leverage(Some(20), 3, 10), 10);
+        // No request: the safety limit.
+        assert_eq!(entry_leverage(None, 3, 10), 10);
+        // A wide stop's safety limit below the floor wins over the floor.
+        assert_eq!(entry_leverage(Some(2), 10, 7), 7);
+        assert_eq!(entry_leverage(Some(1), 1, 7), 1);
+        assert_eq!(entry_leverage(Some(0), 0, 0), 1);
+    }
+
+    #[test]
+    fn ai_margin_is_capped_by_the_budget_and_daily_loss_includes_floating_losses() {
+        // The AI's margin is used as asked, and lowered to 95% of what is free.
+        assert_eq!(entry_margin(Some(30.0), 100.0, 5, 5.0), Some(30.0));
+        assert_eq!(entry_margin(Some(500.0), 100.0, 5, 5.0), Some(95.0));
+        assert_eq!(entry_margin(Some(30.0), 0.0, 5, 5.0), None);
+        // Without a request the budget is split over the affordable slots.
+        assert_eq!(entry_margin(None, 100.0, 5, 5.0), Some(19.0));
+        // A capital limit counts the margin already in use.
+        assert_eq!(trade_budget(None, 40.0, 60.0), 60.0);
+        assert_eq!(trade_budget(Some(50.0), 40.0, 60.0), 10.0);
+        assert_eq!(trade_budget(Some(30.0), 40.0, 60.0), 0.0);
         assert_eq!(daily_pnl(-1.0, &[-3.0, 2.0]), -4.0);
         assert_eq!(daily_pnl(0.0, &[5.0]), 0.0);
         let mut c = Config {

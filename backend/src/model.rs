@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-/// Hard limits the AI cannot exceed. Direction, how many positions to hold and how much to
-/// risk on each are the AI's decisions inside them.
+/// Hard limit the AI cannot exceed. Direction, how many positions to hold and how much capital
+/// to commit to each are the AI's decisions inside it.
 pub const MAX_OPEN: usize = 5;
-pub const MAX_RISK_PER_TRADE_PCT: f64 = 2.0;
+/// The AI may not close a position it has held for less than this; the stop still protects it.
+/// It stops a run from abandoning the previous run's entry on the same evidence.
+pub const MIN_HOLD_BEFORE_AI_CLOSE_MINUTES: i64 = 60;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -12,11 +14,12 @@ pub struct Config {
     pub market: String,
     pub pairs: Vec<String>,
     pub max_open: usize,
+    /// Highest leverage the AI may use.
     pub leverage: u32,
+    /// Lowest leverage the AI may use; the stop's safety limit still wins when it is lower.
+    pub min_leverage: u32,
     pub short: bool,
     pub capital: Option<f64>,
-    /// Maximum loss per trade at its stop, as a percentage of trading equity.
-    pub risk_per_trade_pct: f64,
     /// Most open positions in the same direction; 0 means no limit. Correlated
     /// coins move together, so this caps how concentrated the book can be.
     pub max_same_direction: usize,
@@ -32,9 +35,9 @@ impl Default for Config {
             pairs: vec!["BTC/USDT".into(), "ETH/USDT".into(), "SOL/USDT".into()],
             max_open: MAX_OPEN,
             leverage: 1,
+            min_leverage: 1,
             short: false,
             capital: None,
-            risk_per_trade_pct: MAX_RISK_PER_TRADE_PCT,
             max_same_direction: 0,
             running: false,
             ai: AiConfig::default(),

@@ -5,11 +5,14 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
 
 
+# upgrade.sh runs on the Linux server and relies on GNU tools (flock, mv -T, sha256sum -c).
+@unittest.skipUnless(sys.platform.startswith("linux"), "upgrade.sh 只在 Linux 上测试（需要 flock 和 GNU 工具）")
 class UpgradeTests(unittest.TestCase):
     def run_upgrade(self, fail_new=False, corrupt=False):
         with tempfile.TemporaryDirectory(prefix="tide-deploy-test-") as temporary:
