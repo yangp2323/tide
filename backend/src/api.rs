@@ -270,10 +270,12 @@ async fn handle(
             validate(&c)?;
             let ex = app.exchange(&c);
             ex.wallet().await?;
-            // A fresh start re-baselines the circuit breakers on today's equity.
-            let (equity, _, _) = app.account_risk(&ex, &app.store.open_trades()?).await?;
-            app.store.set_state("equity_peak", &equity.to_string())?;
+            // A fresh start re-baselines the circuit breakers: the drawdown high-water mark is
+            // Tide's trading PnL right now (nothing realized since the new start, plus whatever
+            // open positions show), and the losing streak counts from here.
+            let (_, _, _, open_pnl) = app.account_view(&ex, &app.store.open_trades()?).await?;
             app.store.set_state("breaker_since", &crate::model::now())?;
+            app.store.set_state("pnl_peak", &open_pnl.to_string())?;
             c.running = true;
         }
         ("POST", "/api/bot/stop") => {

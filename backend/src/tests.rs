@@ -655,6 +655,8 @@ struct Sim {
     external: Vec<Value>,
     manual_orders: Vec<Value>,
     calls: Vec<(String, Value)>,
+    /// USDT in the wallet; 1000 unless a test moves funds in or out.
+    wallet: Option<f64>,
 }
 async fn sim_exchange(
     State(sim): State<Arc<Mutex<Sim>>>,
@@ -671,7 +673,8 @@ async fn sim_exchange(
     s.calls.push((path.clone(), body.clone()));
     let result = match path.as_str() {
         "/v5/account/wallet-balance" => {
-            json!({"list":[{"coin":[{"coin":"USDT","equity":"1000","walletBalance":"1000","locked":"0","totalPositionIM":"0","totalOrderIM":"0"}]}]})
+            let usdt = s.wallet.unwrap_or(1000.0).to_string();
+            json!({"list":[{"coin":[{"coin":"USDT","equity":usdt,"walletBalance":usdt,"locked":"0","totalPositionIM":"0","totalOrderIM":"0"}]}]})
         }
         "/v5/account/info" => json!({"marginMode":"ISOLATED_MARGIN"}),
         "/v5/account/transaction-log" => json!({"list":[]}),
@@ -1729,6 +1732,55 @@ async fn queued_events_start_one_run_within_the_limits() {
         .unwrap()
         .contains("\"type\":\"scheduled\""));
     model_server.abort();
+    server.abort();
+    std::env::remove_var("BYBIT_BASE_URL");
+    drop(app);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn withdrawals_do_not_trip_the_drawdown_breaker_but_trading_losses_do() {
+    let _env = EXCHANGE.lock().await;
+    let sim = Arc::new(Mutex::new(Sim {
+        futures: true,
+        price: 10.0,
+        ..Sim::default()
+    }));
+    let cfg = model::Config {
+        market: "futures".into(),
+        pairs: vec!["BTC/USDT:USDT".into()],
+        leverage: 5,
+        short: true,
+        ..model::Config::default()
+    };
+    let (app, dir, server) = sim_app(&sim, cfg).await;
+    // 50 USDT at 5x: 25 contracts long at 10, stop at 9.6.
+    let mut action = open_long("BTC/USDT:USDT");
+    action["margin_usdt"] = json!(50);
+    let result = app.execute_actions(&[action], false).await.unwrap();
+    assert_eq!(result[0]["status"], "executed", "{}", result[0]);
+    // The watchdog checks once a minute; clear its timer so each tick checks.
+    let watch = || async {
+        app.store.set_state("watchdog_at", "0").unwrap();
+        let _lock = app.gate.lock().await;
+        app.tick().await.unwrap();
+    };
+    watch().await;
+    assert!(app.store.config().unwrap().running);
+    // The operator moves 980 of the 1000 USDT out. The wallet falls 98%, Tide's trading PnL
+    // does not, so the bot keeps running (the old equity-based check paused it here).
+    sim.lock().await.wallet = Some(20.0);
+    watch().await;
+    assert!(app.store.config().unwrap().running);
+    // A real loss counts against what is left: 25 × 0.3 = 7.5 lost of about 27.5 is past 20%.
+    sim.lock().await.price = 9.7;
+    watch().await;
+    assert!(!app.store.config().unwrap().running);
+    let logs = app.store.logs(5).unwrap().to_string();
+    assert!(
+        logs.contains("交易回撤") && logs.contains("不含出入金"),
+        "{logs}"
+    );
     server.abort();
     std::env::remove_var("BYBIT_BASE_URL");
     drop(app);

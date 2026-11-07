@@ -249,16 +249,27 @@ pub fn stop_price(t: &Trade, price: f64) -> (f64, f64) {
     };
     (peak, stop)
 }
-/// Account-level circuit breakers: drawdown from the equity high-water mark, and a run of
-/// losing trades closed since the bot was last started. `recent` is newest first.
-pub fn breaker(c: &Config, recent: &[Trade], equity: f64, peak: f64) -> Result<()> {
+/// Drawdown in percent from the high-water mark of Tide's own trading PnL. Deposits and
+/// withdrawals move the wallet but not that PnL, so they never count as a loss. The amount lost
+/// is measured against what the account would hold back at the high with the funds in it now,
+/// so a loss after a withdrawal still counts in full against the smaller balance.
+pub fn drawdown_pct(pnl: f64, peak: f64, equity: f64) -> Option<f64> {
+    if !(pnl.is_finite() && peak.is_finite() && equity.is_finite()) {
+        return None;
+    }
+    let lost = (peak - pnl).max(0.0);
+    let base = equity + lost;
+    (base > 0.0).then(|| lost / base * 100.0)
+}
+/// Account-level circuit breakers: drawdown of Tide's trading PnL from its high-water mark, and
+/// a run of losing trades closed since the bot was last started. `recent` is newest first.
+pub fn breaker(c: &Config, recent: &[Trade], drawdown: Option<f64>) -> Result<()> {
     let limit = c.ai.max_drawdown_pct;
-    if limit > 0.0 && peak > 0.0 && equity.is_finite() {
-        let drawdown = (peak - equity) / peak * 100.0;
+    if let Some(d) = drawdown.filter(|_| limit > 0.0) {
         ensure!(
-            drawdown < limit,
-            "账户回撤 {:.1}% 达到熔断线 {}%，暂停新开仓",
-            drawdown,
+            d < limit,
+            "交易回撤 {:.1}% 达到熔断线 {}%（按 Tide 交易盈亏计算，不含出入金），暂停新开仓",
+            d,
             limit
         );
     }
@@ -441,6 +452,11 @@ impl App {
     }
     /// Account equity (spot holdings at market), free USDT and today's PnL for the loss limit.
     pub async fn account_risk(&self, ex: &Bybit, held: &[Trade]) -> Result<(f64, f64, f64)> {
+        let (equity, free, pnl, _) = self.account_view(ex, held).await?;
+        Ok((equity, free, pnl))
+    }
+    /// `account_risk` plus the open positions' total floating PnL, for the drawdown breaker.
+    pub async fn account_view(&self, ex: &Bybit, held: &[Trade]) -> Result<(f64, f64, f64, f64)> {
         let (mut equity, free) = usdt(&ex.wallet().await?);
         let mut unrealized = vec![];
         for t in held {
@@ -451,7 +467,38 @@ impl App {
             unrealized.push(num(&t.mark(price)["profit_abs"]));
         }
         let pnl = daily_pnl(self.store.realized_on(&day())?, &unrealized);
-        Ok((equity, free, pnl))
+        Ok((equity, free, pnl, unrealized.iter().sum()))
+    }
+    /// When the circuit breakers were last re-based (the bot's last start), set to now if never.
+    /// Losses from before it existed must not block the first entry after an upgrade.
+    pub fn breaker_since(&self) -> Result<String> {
+        match self.store.state("breaker_since")?.filter(|s| !s.is_empty()) {
+            Some(s) => Ok(s),
+            None => {
+                let started = now();
+                self.store.set_state("breaker_since", &started)?;
+                Ok(started)
+            }
+        }
+    }
+    /// Tide's trading PnL since the breakers were re-based (realized plus open positions), its
+    /// high-water mark, and the drawdown from that mark. A missing mark starts at the current
+    /// PnL, so nothing before it counts as a loss.
+    pub fn track_drawdown(&self, equity: f64, open_pnl: f64) -> Result<Option<f64>> {
+        let pnl = self.store.realized_since(&self.breaker_since()?)? + open_pnl;
+        if !pnl.is_finite() {
+            return Ok(None);
+        }
+        let stored = self
+            .store
+            .state("pnl_peak")?
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|p| p.is_finite());
+        let peak = stored.map_or(pnl, |p| p.max(pnl));
+        if stored != Some(peak) {
+            self.store.set_state("pnl_peak", &peak.to_string())?;
+        }
+        Ok(drawdown_pct(pnl, peak, equity))
     }
     pub async fn reconcile(&self, c: &Config) -> Result<()> {
         let ex = self.exchange(c);
@@ -511,7 +558,7 @@ impl App {
         );
         let ex = self.exchange(&c);
         let held = self.store.open_trades()?;
-        let (equity, free, pnl) = self.account_risk(&ex, &held).await?;
+        let (equity, free, pnl, open_pnl) = self.account_view(&ex, &held).await?;
         ensure!(
             self.store
                 .state("risk_error")?
@@ -521,23 +568,14 @@ impl App {
         );
         let ai = tag != "trend";
         entry_guard(&c, &held, pnl, equity, pair, short, confidence, ai)?;
-        let peak = self.track_equity(equity)?;
-        // Losses from before the breaker existed must not block the first entry after an upgrade.
-        let since = match self.store.state("breaker_since")?.filter(|s| !s.is_empty()) {
-            Some(s) => s,
-            None => {
-                let started = now();
-                self.store.set_state("breaker_since", &started)?;
-                started
-            }
-        };
+        let drawdown = self.track_drawdown(equity, open_pnl)?;
+        let since = self.breaker_since()?;
         breaker(
             &c,
             &self
                 .store
                 .closed_since(&since, c.ai.max_consecutive_losses as usize)?,
-            equity,
-            peak,
+            drawdown,
         )?;
         let ins = ex.instrument(&c.market, pair).await?;
         let price = ex.price(&c.market, pair).await?;
@@ -937,21 +975,8 @@ impl App {
         }
         self.store.set_state(&key, "")
     }
-    /// Highest equity seen since the bot was last started.
-    pub fn track_equity(&self, equity: f64) -> Result<f64> {
-        let peak: f64 = self
-            .store
-            .state("equity_peak")?
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0);
-        if equity.is_finite() && equity > peak {
-            self.store.set_state("equity_peak", &equity.to_string())?;
-            return Ok(equity);
-        }
-        Ok(peak)
-    }
-    /// Once a minute, pause the bot if equity has fallen past the drawdown limit. Existing
-    /// positions keep their stops.
+    /// Once a minute, pause the bot if Tide's trading PnL has fallen past the drawdown limit.
+    /// Existing positions keep their stops.
     async fn watchdog(&self, c: &Config, ex: &Bybit) -> Result<()> {
         if !c.running || c.ai.max_drawdown_pct <= 0.0 {
             return Ok(());
@@ -967,8 +992,8 @@ impl App {
         }
         self.store.set_state("watchdog_at", &nowts.to_string())?;
         let held = self.store.open_trades()?;
-        let (equity, _, _) = self.account_risk(ex, &held).await?;
-        let peak = self.track_equity(equity)?;
+        let (equity, _, _, open_pnl) = self.account_view(ex, &held).await?;
+        let drawdown = self.track_drawdown(equity, open_pnl)?;
         if let Err(e) = breaker(
             &Config {
                 ai: AiConfig {
@@ -978,8 +1003,7 @@ impl App {
                 ..c.clone()
             },
             &[],
-            equity,
-            peak,
+            drawdown,
         ) {
             let mut paused = self.store.config()?;
             paused.running = false;
@@ -1424,23 +1448,35 @@ mod tests {
         let mut c = Config::default();
         c.ai.max_drawdown_pct = 20.0;
         c.ai.max_consecutive_losses = 3;
-        assert!(breaker(&c, &[], 100.0, 100.0).is_ok());
-        assert!(breaker(&c, &[], 81.0, 100.0).is_ok());
-        assert!(breaker(&c, &[], 80.0, 100.0).is_err());
+        assert!(breaker(&c, &[], Some(0.0)).is_ok());
+        assert!(breaker(&c, &[], Some(19.0)).is_ok());
+        assert!(breaker(&c, &[], Some(20.0)).is_err());
+        assert!(breaker(&c, &[], None).is_ok());
         let loss = sample(false, -1.0);
         let win = sample(false, 2.0);
-        assert!(breaker(&c, &[loss.clone(), loss.clone()], 100.0, 100.0).is_ok());
-        assert!(breaker(&c, &[loss.clone(), win.clone(), loss.clone()], 100.0, 100.0).is_ok());
-        assert!(breaker(
-            &c,
-            &[loss.clone(), loss.clone(), loss.clone()],
-            100.0,
-            100.0
-        )
-        .is_err());
+        assert!(breaker(&c, &[loss.clone(), loss.clone()], Some(0.0)).is_ok());
+        assert!(breaker(&c, &[loss.clone(), win.clone(), loss.clone()], Some(0.0)).is_ok());
+        assert!(breaker(&c, &[loss.clone(), loss.clone(), loss.clone()], Some(0.0)).is_err());
         c.ai.max_consecutive_losses = 0;
         c.ai.max_drawdown_pct = 0.0;
-        assert!(breaker(&c, &[loss.clone(), loss.clone(), loss], 1.0, 100.0).is_ok());
+        assert!(breaker(&c, &[loss.clone(), loss.clone(), loss], Some(99.0)).is_ok());
+    }
+
+    #[test]
+    fn drawdown_follows_trading_pnl_not_deposits_or_withdrawals() {
+        // At the high: nothing lost.
+        assert_eq!(drawdown_pct(5.0, 5.0, 100.0), Some(0.0));
+        // Withdrawing 70 of 90 leaves the trading PnL alone: still no drawdown (the 11-06
+        // false trigger saw 92.7% here).
+        assert_eq!(drawdown_pct(0.0, 0.0, 20.0), Some(0.0));
+        // A deposit does not hide a loss either: 10 lost, now 190 in the account → 10 / 200.
+        assert_eq!(drawdown_pct(-10.0, 0.0, 190.0), Some(5.0));
+        // After a withdrawal a loss counts against the smaller balance: 4 lost, 16 left → 20%.
+        assert_eq!(drawdown_pct(-4.0, 0.0, 16.0), Some(20.0));
+        // Profit above the mark is not a drawdown; an empty account has none to measure.
+        assert_eq!(drawdown_pct(8.0, 5.0, 100.0), Some(0.0));
+        assert_eq!(drawdown_pct(0.0, 0.0, 0.0), None);
+        assert_eq!(drawdown_pct(f64::NAN, 0.0, 10.0), None);
     }
 
     #[test]

@@ -167,6 +167,15 @@ impl Store {
         v.truncate(limit);
         Ok(v)
     }
+    /// Realized PnL of trades closed after `since` ("YYYY-MM-DD HH:MM:SS").
+    pub fn realized_since(&self, since: &str) -> Result<f64> {
+        let db = self.db.lock().unwrap();
+        Ok(db.query_row(
+            "SELECT COALESCE(SUM(json_extract(data,'$.profit_abs')),0) FROM trades WHERE json_extract(data,'$.close_date') > ?1",
+            [since],
+            |r| r.get(0),
+        )?)
+    }
     /// Realized PnL of trades closed on the given UTC day ("YYYY-MM-DD").
     pub fn realized_on(&self, day: &str) -> Result<f64> {
         let db = self.db.lock().unwrap();

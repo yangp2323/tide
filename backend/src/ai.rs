@@ -86,7 +86,6 @@ impl App {
             self.store.realized_on(&crate::model::day())?,
         );
         let live = self.exchange_view(&ex, &c, &held).await;
-        self.track_equity(equity)?;
         let mut recent: Vec<_> = self
             .store
             .trades()?

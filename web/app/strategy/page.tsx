@@ -351,10 +351,10 @@ export default function StrategyPage() {
               </div>
               <div>
                 <label className="f" htmlFor="rkDrawdown">
-                  账户回撤达到 % 暂停机器人（0 = 不限）
+                  交易回撤达到 % 暂停机器人（0 = 不限）
                 </label>
                 <input id="rkDrawdown" type="number" step={1} min={0} max={90} value={risk.max_drawdown_pct} onChange={(e) => setRisk({ ...risk, max_drawdown_pct: +e.target.value })} />
-                <p className="hint">从机器人每次启动时的权益算起，触发后自动暂停，已有仓位的止损仍然执行。</p>
+                <p className="hint">按 Tide 的交易盈亏从机器人每次启动以来的最高点算回落，出入金不算亏损。触发后自动暂停，已有仓位的止损仍然执行。</p>
               </div>
               <div>
                 <label className="f" htmlFor="rkStreak">
