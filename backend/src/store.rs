@@ -232,6 +232,18 @@ impl Store {
         )?;
         Ok(())
     }
+    /// Record a filled add: the merged position and the order's final state together.
+    pub fn settle_add(&self, merged: &Trade, link: &str) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        tx.execute(
+            "UPDATE trades SET data=? WHERE id=?",
+            params![serde_json::to_string(merged)?, merged.trade_id],
+        )?;
+        tx.execute("UPDATE orders SET state='filled' WHERE link=?", [link])?;
+        tx.commit()?;
+        Ok(())
+    }
     pub fn settle_exit(&self, t: &Trade, remaining: Option<&Trade>, link: &str) -> Result<()> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction()?;

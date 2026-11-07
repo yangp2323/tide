@@ -728,7 +728,18 @@ async fn sim_exchange(
                         s.positions.retain(|p| p["symbol"] != sym);
                     } else {
                         let side = body["side"].clone();
-                        s.positions.push(json!({"symbol":sym,"side":side,"size":body["qty"],"positionIdx":"0","stopLoss":body["stopLoss"],"takeProfit":body.get("takeProfit").cloned().unwrap_or(json!("0"))}));
+                        // One-way mode: more in the same direction grows the one position and
+                        // keeps its stop and take profit.
+                        if let Some(p) = s
+                            .positions
+                            .iter_mut()
+                            .find(|p| p["symbol"] == sym && p["side"] == side)
+                        {
+                            let size = model::num(&p["size"]) + model::num(&body["qty"]);
+                            p["size"] = json!(size.to_string());
+                        } else {
+                            s.positions.push(json!({"symbol":sym,"side":side,"size":body["qty"],"positionIdx":"0","stopLoss":body["stopLoss"],"takeProfit":body.get("takeProfit").cloned().unwrap_or(json!("0"))}));
+                        }
                     }
                 }
             }
@@ -1781,6 +1792,113 @@ async fn withdrawals_do_not_trip_the_drawdown_breaker_but_trading_losses_do() {
         logs.contains("交易回撤") && logs.contains("不含出入金"),
         "{logs}"
     );
+    server.abort();
+    std::env::remove_var("BYBIT_BASE_URL");
+    drop(app);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn ai_adds_to_an_open_position_at_its_leverage_and_stop() {
+    let _env = EXCHANGE.lock().await;
+    let sim = Arc::new(Mutex::new(Sim {
+        futures: true,
+        price: 10.0,
+        ..Sim::default()
+    }));
+    let cfg = model::Config {
+        market: "futures".into(),
+        pairs: vec!["BTC/USDT:USDT".into()],
+        leverage: 5,
+        short: true,
+        ..model::Config::default()
+    };
+    let (app, dir, server) = sim_app(&sim, cfg).await;
+    // 50 USDT at 5x: 25 contracts long at 10, stop 9.6, take profit 10.8.
+    let mut action = open_long("BTC/USDT:USDT");
+    action["margin_usdt"] = json!(50);
+    let result = app.execute_actions(&[action], false).await.unwrap();
+    assert_eq!(result[0]["status"], "executed", "{}", result[0]);
+    // Price runs to 10.5 and the AI adds 50 USDT more: 250 / 10.5 rounds down to 23.8.
+    sim.lock().await.price = 10.5;
+    let add = json!({"action":"add","pair":"BTC/USDT:USDT","confidence":0.9,"margin_usdt":50,"reason":"突破后放量延续"});
+    let result = app
+        .execute_actions(std::slice::from_ref(&add), false)
+        .await
+        .unwrap();
+    assert_eq!(result[0]["status"], "executed", "{}", result[0]);
+    let held = app.store.open_trades().unwrap();
+    assert_eq!(
+        held.len(),
+        1,
+        "an add grows the position, it does not open another"
+    );
+    let t = &held[0];
+    assert!((t.amount - 48.8).abs() < 1e-9, "{}", t.amount);
+    assert!((t.open_rate - (250.0 + 23.8 * 10.5) / 48.8).abs() < 1e-9);
+    assert!((t.stake_amount - (50.0 + 23.8 * 10.5 / 5.0)).abs() < 1e-9);
+    assert_eq!(t.leverage, 5);
+    assert!((t.stop_loss_abs - 9.6).abs() < 1e-9 && (t.take_profit_abs - 10.8).abs() < 1e-9);
+    assert!(t.entry_reason.contains("突破后回踩确认") && t.entry_reason.contains("突破后放量延续"));
+    assert_eq!(sim.lock().await.positions.len(), 1);
+    // The exchange and the record agree, so the next check finds nothing to repair.
+    {
+        let _lock = app.gate.lock().await;
+        app.tick().await.unwrap();
+    }
+    assert_eq!(app.store.open_trades().unwrap()[0].amount, t.amount);
+    // At 13, adding 500 more would put the average near 12.4: the 9.6 stop would then be
+    // past 60% of the way to liquidation at 5x, so the add is refused before any order.
+    sim.lock().await.price = 13.0;
+    let orders = sim.lock().await.count;
+    let mut big = add.clone();
+    big["margin_usdt"] = json!(500);
+    let result = app.execute_actions(&[big], false).await.unwrap();
+    assert_eq!(result[0]["status"], "failed", "{}", result[0]);
+    assert!(result[0]["note"].as_str().unwrap().contains("离强平太近"));
+    // An add needs a margin and an existing position; neither reaches the exchange.
+    let mut no_margin = add.clone();
+    no_margin.as_object_mut().unwrap().remove("margin_usdt");
+    let mut no_position = add.clone();
+    no_position["pair"] = json!("ETH/USDT:USDT");
+    for bad in [no_margin, no_position] {
+        let result = app.execute_actions(&[bad], false).await.unwrap();
+        assert_eq!(result[0]["status"], "failed", "{}", result[0]);
+    }
+    assert_eq!(sim.lock().await.count, orders);
+    // The process stops after an add reached the exchange but before it was confirmed: the
+    // next reconcile merges the fill into the position instead of opening or losing it.
+    sim.lock().await.price = 10.5;
+    let before = app.store.open_trades().unwrap().remove(0);
+    let link = "tadd-recovered";
+    let body = json!({"category":"linear","symbol":"BTCUSDT","side":"Buy","orderType":"Market","qty":"2.0","orderLinkId":link,"positionIdx":0});
+    app.store
+        .reserve(
+            link,
+            "add",
+            &before.pair,
+            &json!({"trade":before,"request":body,"reason":"恢复"}),
+        )
+        .unwrap();
+    let config = app.store.config().unwrap();
+    app.exchange(&config)
+        .post("/v5/order/create", body)
+        .await
+        .unwrap();
+    assert_eq!(app.store.unresolved().unwrap().len(), 1);
+    app.reconcile(&config).await.unwrap();
+    assert!(app.store.unresolved().unwrap().is_empty());
+    let after = app.store.open_trades().unwrap();
+    assert_eq!(after.len(), 1);
+    assert!(
+        (after[0].amount - (before.amount + 2.0)).abs() < 1e-9,
+        "{}",
+        after[0].amount
+    );
+    {
+        let _lock = app.gate.lock().await;
+        app.tick().await.unwrap();
+    }
     server.abort();
     std::env::remove_var("BYBIT_BASE_URL");
     drop(app);

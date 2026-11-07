@@ -41,6 +41,6 @@ export const WHY: Record<string, string> = {
   liquidation: "爆仓",
 };
 
-export const AI_ACT: Record<string, string> = { open_long: "开多", open_short: "开空", close: "平仓" };
+export const AI_ACT: Record<string, string> = { open_long: "开多", open_short: "开空", add: "加仓", close: "平仓", set_stops: "改止损" };
 export const AI_STATUS: Record<string, string> = { executed: "已执行", blocked: "风控拦截", failed: "失败" };
 export const AI_SOURCE: Record<string, string> = { auto: "定时", manual: "手动", mcp: "外部接口", review: "复盘", hook: "事件触发" };

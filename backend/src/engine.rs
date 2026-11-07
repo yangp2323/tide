@@ -43,21 +43,61 @@ pub fn entry_guard(
         "同方向持仓已达上限"
     );
     if ai {
-        ensure!(c.ai.enabled, "AI 交易未开启");
-        let start = equity - pnl;
-        ensure!(start > 0.0, "无法确定当日起始权益");
-        ensure!(
-            pnl / start * 100.0 > -c.ai.max_daily_loss_pct,
-            "达到当日亏损上限"
-        );
-        if let Some(conf) = confidence {
-            ensure!(
-                conf.is_finite() && (0.0..=1.0).contains(&conf) && conf >= c.ai.min_confidence,
-                "低于最低置信度或置信度无效"
-            );
-        }
+        ai_entry_limits(c, pnl, equity, confidence)?;
     }
     Ok(())
+}
+/// The AI's limits on adding exposure: AI trading on, today's loss limit and min confidence.
+fn ai_entry_limits(c: &Config, pnl: f64, equity: f64, confidence: Option<f64>) -> Result<()> {
+    ensure!(c.ai.enabled, "AI 交易未开启");
+    let start = equity - pnl;
+    ensure!(start > 0.0, "无法确定当日起始权益");
+    ensure!(
+        pnl / start * 100.0 > -c.ai.max_daily_loss_pct,
+        "达到当日亏损上限"
+    );
+    if let Some(conf) = confidence {
+        ensure!(
+            conf.is_finite() && (0.0..=1.0).contains(&conf) && conf >= c.ai.min_confidence,
+            "低于最低置信度或置信度无效"
+        );
+    }
+    Ok(())
+}
+/// Checks for adding to an existing position. Slot counts and the one-position-per-pair rule
+/// do not apply, since no new position is opened; the account's entry limits do.
+pub fn add_guard(
+    c: &Config,
+    pnl: f64,
+    equity: f64,
+    pair: &str,
+    confidence: Option<f64>,
+) -> Result<()> {
+    ensure!(c.running, "机器人已暂停");
+    ensure!(c.pairs.iter().any(|p| p == pair), "交易对不在已选币种中");
+    ai_entry_limits(c, pnl, equity, confidence)
+}
+/// The position after adding `qty` filled at `price`: the entry becomes the weighted average
+/// and margin and fees add up. Stop, take profit, opening time and trailing settings stay.
+pub fn merge_add(t: &Trade, qty: f64, price: f64, fee: f64) -> Trade {
+    let mut m = t.clone();
+    let amount = t.amount + qty;
+    m.open_rate = (t.open_rate * t.amount + price * qty) / amount;
+    m.amount = amount;
+    m.stake_amount = t.stake_amount + qty * price / t.leverage.max(1) as f64;
+    m.entry_fee = t.entry_fee + fee;
+    m
+}
+/// Whether the stop still triggers well before isolated-margin liquidation, which sits about
+/// 1 / leverage from the entry: the same 60% rule as a new entry. A stop already on the profit
+/// side of the entry is safe.
+pub fn stop_ahead_of_liquidation(t: &Trade) -> bool {
+    let loss_side = if t.is_short {
+        t.stop_loss_abs - t.open_rate
+    } else {
+        t.open_rate - t.stop_loss_abs
+    } / t.open_rate;
+    loss_side.is_finite() && loss_side <= 0.6 / t.leverage.max(1) as f64 + 1e-9
 }
 /// Share of the budget that may be committed as margin; the rest covers fees and slippage.
 pub const USABLE: f64 = 0.95;
@@ -338,6 +378,33 @@ impl App {
             self.store.log(
                 "INFO",
                 &format!("开仓 {} {} @ {}", t.pair, t.amount, t.open_rate),
+            );
+        } else if order["action"] == "add" {
+            // An add merges into the position it was placed for, partial fills included.
+            let current = self
+                .store
+                .open_trades()?
+                .into_iter()
+                .find(|x| x.trade_id == t.trade_id)
+                .context("加仓订单对应的持仓不存在")?;
+            let mut merged = merge_add(&current, fill.qty, fill.price, fill.fee);
+            // The next run sees why the position grew next to why it was opened.
+            if let Some(why) = order["data"]["reason"].as_str().filter(|r| !r.is_empty()) {
+                merged.entry_reason = crate::ai::clip(
+                    &format!(
+                        "{}\n加仓 {} @ {}：{}",
+                        merged.entry_reason, fill.qty, fill.price, why
+                    ),
+                    2000,
+                );
+            }
+            self.store.settle_add(&merged, link)?;
+            self.store.log(
+                "INFO",
+                &format!(
+                    "加仓 {} {} @ {}，合计 {}，均价 {}",
+                    merged.pair, fill.qty, fill.price, merged.amount, merged.open_rate
+                ),
             );
         } else {
             // A close can partially fill. Only the filled fraction becomes a closed trade.
@@ -750,6 +817,141 @@ impl App {
             .telegram(
                 &c,
                 &format!("开仓 {} {}", pair, if short { "空" } else { "多" }),
+            )
+            .await;
+        Ok(())
+    }
+    /// Add margin to an open futures position of Tide's, in the same direction and at its
+    /// leverage. The stop and take profit stay; the add is refused if, at the new average entry,
+    /// the stop would sit too close to liquidation.
+    pub async fn add_position(
+        &self,
+        id: i64,
+        confidence: Option<f64>,
+        margin_usdt: Option<f64>,
+        reason: Option<String>,
+    ) -> Result<()> {
+        // Caller must hold gate from fresh risk checks through durable reservation and submission.
+        let c = self.store.config()?;
+        self.reconcile(&c).await?;
+        ensure!(
+            self.store.unresolved()?.is_empty(),
+            "有待核对订单，禁止继续开仓"
+        );
+        let held = self.store.open_trades()?;
+        let t = held
+            .iter()
+            .find(|t| t.trade_id == id)
+            .cloned()
+            .context("持仓不存在或已平仓")?;
+        ensure!(t.market == "futures", "现货暂不支持加仓");
+        let margin = margin_usdt.context("加仓需要给出 margin_usdt")?;
+        ensure!(margin.is_finite() && margin > 0.0, "保证金金额无效");
+        let ex = self.exchange(&c);
+        let (equity, free, pnl, open_pnl) = self.account_view(&ex, &held).await?;
+        ensure!(
+            self.store
+                .state("risk_error")?
+                .unwrap_or_default()
+                .is_empty(),
+            "持仓核对异常，暂停新开仓；请查看运行日志"
+        );
+        add_guard(&c, pnl, equity, &t.pair, confidence)?;
+        let drawdown = self.track_drawdown(equity, open_pnl)?;
+        breaker(
+            &c,
+            &self
+                .store
+                .closed_since(&self.breaker_since()?, c.ai.max_consecutive_losses as usize)?,
+            drawdown,
+        )?;
+        let used: f64 = held.iter().map(|t| t.stake_amount).sum();
+        let budget = trade_budget(c.capital, used, free);
+        let stake = entry_margin(Some(margin), budget, 0, 0.0).context("可用资金不足，无法加仓")?;
+        // The exchange must show exactly the recorded position before more is added to it.
+        let sym = symbol(&t.pair);
+        let side = if t.is_short { "Sell" } else { "Buy" };
+        let size: f64 = ex
+            .positions()
+            .await?
+            .iter()
+            .filter(|p| p["symbol"] == sym && p["side"] == side)
+            .map(|p| num(&p["size"]))
+            .sum();
+        ensure!(
+            (size - t.amount).abs() <= t.amount * 1e-8,
+            "{} 交易所仓位数量与记录不一致，不能加仓",
+            t.pair
+        );
+        let ins = ex.instrument(&c.market, &t.pair).await?;
+        let price = ex.price(&c.market, &t.pair).await?;
+        let step = ins["lotSizeFilter"]["qtyStep"]
+            .as_str()
+            .context("缺少下单精度")?;
+        ensure!(price.is_finite() && price > 0.0, "交易所价格无效");
+        let min_stake = min_order_notional(&ins, true, price)
+            .context("交易所价格或下单精度无效")?
+            / t.leverage.max(1) as f64;
+        ensure!(
+            stake.is_finite() && stake >= min_stake,
+            "按 {:.2} USDT 保证金、{} 倍杠杆计算的加仓低于交易所最小下单额（至少需要 {:.2} USDT 保证金）",
+            stake,
+            t.leverage,
+            min_stake
+        );
+        let qty = quantize(stake * t.leverage as f64 / price, step)?;
+        let amount: f64 = qty.parse()?;
+        ensure!(
+            amount * price >= num(&ins["lotSizeFilter"]["minNotionalValue"])
+                && amount >= num(&ins["lotSizeFilter"]["minOrderQty"]),
+            "订单低于交易所最小金额或数量"
+        );
+        let max_qty = num(&ins["lotSizeFilter"]["maxMktOrderQty"]);
+        ensure!(
+            max_qty == 0.0 || amount <= max_qty,
+            "订单超过市价单数量上限"
+        );
+        ensure!(
+            stop_ahead_of_liquidation(&merge_add(&t, amount, price, 0.0)),
+            "加仓后按新均价计算，止损 {} 离强平太近；先用 set_stops 收紧止损再加仓",
+            t.stop_loss_abs
+        );
+        let link = format!("t{}", uuid::Uuid::new_v4().simple());
+        // No stop on the order: the position's own stop and take profit cover the whole size.
+        let body = json!({"category":"linear","symbol":sym,"side":side,"orderType":"Market","qty":qty,"orderLinkId":link,"positionIdx":0});
+        self.store.reserve(
+            &link,
+            "add",
+            &t.pair,
+            &json!({"trade":t,"request":body,"reason":reason}),
+        )?;
+        if let Err(e) = ex.post("/v5/order/create", body).await {
+            if e.downcast_ref::<crate::exchange::Rejected>()
+                .is_some_and(|e| e.definitive())
+            {
+                self.store.order_state(&link, "rejected")?;
+            }
+            self.store
+                .log("ERROR", &format!("订单 {} 提交失败：{}", link, e));
+            return Err(e);
+        }
+        self.await_order(&c, &link).await?;
+        // Re-assert the stop for the larger position; tick repairs it if this fails.
+        if let Some(merged) = self
+            .store
+            .open_trades()?
+            .into_iter()
+            .find(|x| x.trade_id == id)
+        {
+            if let Err(e) = self.push_stops(&ex, &merged).await {
+                self.store
+                    .log("WARNING", &format!("{} 加仓后止损同步失败：{}", t.pair, e));
+            }
+        }
+        let _ = self
+            .telegram(
+                &c,
+                &format!("加仓 {} {}", t.pair, if t.is_short { "空" } else { "多" }),
             )
             .await;
         Ok(())
@@ -1308,6 +1510,40 @@ mod tests {
         // A clock behind the open time still waits; an unreadable time does not block.
         assert!(ai_close_guard(open, at("2026-11-04 00:30:00")).is_err());
         assert!(ai_close_guard("", at("2026-11-04 00:30:00")).is_ok());
+    }
+
+    #[test]
+    fn adds_average_the_entry_and_keep_the_stop_ahead_of_liquidation() {
+        let mut t = sample(false, 0.0);
+        t.open_rate = 10.0;
+        t.amount = 25.0;
+        t.leverage = 5;
+        t.stake_amount = 50.0;
+        t.entry_fee = 0.1;
+        t.stop_loss_abs = 9.6;
+        // 25 more at 11: the entry averages to 10.5, margin and fees add up.
+        let m = merge_add(&t, 25.0, 11.0, 0.2);
+        assert!((m.open_rate - 10.5).abs() < 1e-9 && (m.amount - 50.0).abs() < 1e-9);
+        assert!((m.stake_amount - 105.0).abs() < 1e-9 && (m.entry_fee - 0.3).abs() < 1e-9);
+        assert_eq!((m.stop_loss_abs, m.leverage), (9.6, 5));
+        // At 5x the stop may sit up to 12% from the entry: 9.6 is 8.6% below 10.5.
+        assert!(stop_ahead_of_liquidation(&t));
+        assert!(stop_ahead_of_liquidation(&m));
+        // 25 more at 12 averages to 11, and 9.6 is then 12.7% below: too close.
+        assert!(!stop_ahead_of_liquidation(&merge_add(&t, 25.0, 12.0, 0.0)));
+        // A stop already above a long's entry is always safe.
+        let mut above = m.clone();
+        above.stop_loss_abs = 11.5;
+        assert!(stop_ahead_of_liquidation(&above));
+        // Shorts mirror it: 11.5 is 9.5% above 10.5, 12.0 is 14.3% above.
+        let mut short = m.clone();
+        short.is_short = true;
+        short.stop_loss_abs = 11.5;
+        assert!(stop_ahead_of_liquidation(&short));
+        short.stop_loss_abs = 12.0;
+        assert!(!stop_ahead_of_liquidation(&short));
+        short.stop_loss_abs = 10.0;
+        assert!(stop_ahead_of_liquidation(&short));
     }
 
     #[test]
