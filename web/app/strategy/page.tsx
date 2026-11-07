@@ -27,7 +27,7 @@ export default function StrategyPage() {
   const { confirm } = useFeedback();
   const { busy, msg, setMsg, run } = useAction();
   const riskAction = useAction();
-  const [risk, setRisk] = useState<{ min_confidence: number; daily_profit_target_pct: number; max_daily_loss_pct: number; max_drawdown_pct: number; max_consecutive_losses: number } | null>(null);
+  const [risk, setRisk] = useState<{ min_confidence: number; daily_profit_target_pct: number; max_daily_loss_pct: number; max_drawdown_pct: number; max_consecutive_losses: number; kelly_fraction: number; kelly_cap_pct: number } | null>(null);
 
   const [draft, setDraft] = useState<Draft | null>(null);
   const [mk, setMk] = useState<Record<string, Row[]>>({});
@@ -67,6 +67,8 @@ export default function StrategyPage() {
           max_daily_loss_pct: c.max_daily_loss_pct,
           max_drawdown_pct: c.max_drawdown_pct ?? 20,
           max_consecutive_losses: c.max_consecutive_losses ?? 5,
+          kelly_fraction: c.kelly_fraction ?? 0.5,
+          kelly_cap_pct: c.kelly_cap_pct ?? 5,
         });
       })
       .catch(() => {});
@@ -362,6 +364,20 @@ export default function StrategyPage() {
                 </label>
                 <input id="rkStreak" type="number" step={1} min={0} max={50} value={risk.max_consecutive_losses} onChange={(e) => setRisk({ ...risk, max_consecutive_losses: +e.target.value })} />
                 <p className="hint">只统计机器人启动之后平掉的单，重新启动即可恢复。</p>
+              </div>
+              <div>
+                <label className="f" htmlFor="rkKelly">
+                  仓位按凯利的几成（0.05–1）
+                </label>
+                <input id="rkKelly" type="number" step={0.05} min={0.05} max={1} value={risk.kelly_fraction} onChange={(e) => setRisk({ ...risk, kelly_fraction: +e.target.value })} />
+                <p className="hint">AI 每笔开仓给出盈利概率，系统按它过去预测的准确度校准，期望为负就不开；建议仓位 = 这个比例 × 凯利公式。0.5 即半凯利，越大越激进。</p>
+              </div>
+              <div>
+                <label className="f" htmlFor="rkKellyCap">
+                  建议仓位止损最多亏权益的 %
+                </label>
+                <input id="rkKellyCap" type="number" step={0.5} min={0.1} max={50} value={risk.kelly_cap_pct} onChange={(e) => setRisk({ ...risk, kelly_cap_pct: +e.target.value })} />
+                <p className="hint">只限制系统给出的建议仓位；AI 有具体理由时可以自己指定保证金。高相关的同向持仓会一起盈亏，实际总亏损可能是这个数的几倍。</p>
               </div>
             </div>
             <div className="row">

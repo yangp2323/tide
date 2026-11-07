@@ -1,6 +1,7 @@
 mod ai;
 mod api;
 mod auth;
+mod calibration;
 mod engine;
 mod exchange;
 mod hooks;

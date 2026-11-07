@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 const MAX_AI_NOTES: usize = 12;
 
 const SYSTEM: &str = r#"You are the post-trade reviewer for a crypto trading AI that manages a real Bybit account. Study its closed trades and write durable observations that will improve its future decisions.
-Rules: base every claim on the supplied trades and statistics and state the sample size. With fewer than 5 relevant trades call something a hypothesis, not a finding, and never build a lesson on one trade. Separate process (the entry thesis, stop distance, sizing, the exit decision, overtrading, holding time) from luck, and prefer patterns you can act on: which setups and exits made or lost money, pair and direction effects, how stop distance and holding time related to results, whether discretionary closes beat the exchange-hosted stops. Costs matter: results are net of fees and funding.
+forecast_calibration shows how the trader's win_prob forecasts held up by range: note systematic over- or under-confidence and the setups behind it, with the sample size. Position size is set by the system from calibrated forecasts and a share of Kelly, so do not write fixed per-trade risk amounts, sizing caps or "match the other trades' risk" as rules. Rules: base every claim on the supplied trades and statistics and state the sample size. With fewer than 5 relevant trades call something a hypothesis, not a finding, and never build a lesson on one trade. Separate process (the entry thesis, stop distance, sizing, the exit decision, overtrading, holding time) from luck, and prefer patterns you can act on: which setups and exits made or lost money, pair and direction effects, how stop distance and holding time related to results, whether discretionary closes beat the exchange-hosted stops. Costs matter: results are net of fees and funding.
 You may add, update or delete only notes listed under ai_notes (they have ids), and keep at most max_ai_notes of them: merge duplicates and delete notes the new evidence contradicts. Do not repeat what other_note_titles already cover. A note must never tell the trader to break risk limits. Account-level loss limits are enforced by the system, so never write notes about how much the account lost today, the remaining loss allowance, or trading less after losses. Each note is at most 900 characters of 简体中文 with a short title.
 Return only a JSON object {"summary":"简体中文复盘总结，说明样本量和最重要的发现","changes":[{"op":"add|update|delete","id":123,"title":"标题","content":"内容"}]}. id is required for update and delete only. An empty changes array is correct when the data supports nothing new."#;
 
@@ -171,7 +171,7 @@ impl App {
                     json!({"pair":t.pair,"side":if t.is_short{"short"}else{"long"},"leverage":t.leverage,"opened_utc":t.open_date,"closed_utc":t.close_date,"hold_minutes":hold_minutes(t).map(|m| m.round()),"profit_usdt":t.profit_abs,"profit_pct_on_margin":t.profit_ratio*100.0,"exit_reason":t.exit_reason,"stop_distance_pct":t.stop_dist*100.0,"entry_reason":clip(&t.entry_reason, 300)})
                 })
                 .collect();
-            let snap = json!({"time_utc":now(),"stats":trade_stats(&closed),"recent_trades":recent,"ai_notes":mine,"max_ai_notes":MAX_AI_NOTES,"other_note_titles":others});
+            let snap = json!({"time_utc":now(),"stats":trade_stats(&closed),"forecast_calibration":crate::calibration::Calibration::from_trades(&closed).to_json(),"recent_trades":recent,"ai_notes":mine,"max_ai_notes":MAX_AI_NOTES,"other_note_titles":others});
             let (text, usage) = call_model_for(&c, &snap, &REVIEW).await?;
             rec["usage"] = usage;
             let response: Value = serde_json::from_str(extract_json(&text))?;
@@ -303,6 +303,8 @@ mod tests {
             stop_dist: 0.05,
             entry_reason: String::new(),
             funding: 0.0,
+            win_prob: None,
+            planned_rr: None,
         }
     }
 

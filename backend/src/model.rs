@@ -85,6 +85,10 @@ pub struct AiConfig {
     pub max_drawdown_pct: f64,
     /// Block new entries after this many losing trades in a row; 0 disables it.
     pub max_consecutive_losses: u32,
+    /// Share of the Kelly criterion used for the suggested entry size (0.5 = half Kelly).
+    pub kelly_fraction: f64,
+    /// Most loss at the stop, as a percent of equity, that the suggested size may take.
+    pub kelly_cap_pct: f64,
     /// Analyse and record decisions on schedule without placing any order.
     pub shadow: bool,
     /// Let the AI review its closed trades and keep its own observations in the knowledge base.
@@ -237,6 +241,8 @@ impl Default for AiConfig {
             max_daily_loss_pct: 5.0,
             max_drawdown_pct: 20.0,
             max_consecutive_losses: 5,
+            kelly_fraction: 0.5,
+            kelly_cap_pct: 5.0,
             shadow: false,
             review: true,
             hooks: HookConfig::default(),
@@ -279,6 +285,12 @@ pub struct Trade {
     /// funding (negative is a cost). Futures only.
     #[serde(default)]
     pub funding: f64,
+    /// The AI's forecast at entry that the trade closes in profit, checked against the result.
+    #[serde(default)]
+    pub win_prob: Option<f64>,
+    /// Take-profit distance over stop distance at entry.
+    #[serde(default)]
+    pub planned_rr: Option<f64>,
 }
 impl Trade {
     pub fn mark(&self, price: f64) -> Value {

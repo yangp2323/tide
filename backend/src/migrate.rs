@@ -94,6 +94,8 @@ pub fn run(store: &Store, old: &Path) -> Result<()> {
                 stop_dist: 0.0,
                 entry_reason: String::new(),
                 funding: 0.0,
+                win_prob: None,
+                planned_rr: None,
             });
         }
     }

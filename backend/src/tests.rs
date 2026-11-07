@@ -142,7 +142,9 @@ async fn execution_is_durable_and_closing_releases_position_slots() {
     // The exchange accepts 5 USDT; concurrent holdings, not past entries, limit trading.
     cfg.capital = Some(6.0);
     cfg.max_open = 1;
-    // Without a requested margin the single slot gets 95% of the 6 USDT budget: 5.7.
+    // This test is about durable orders, not sizing: each entry asks for more margin than the
+    // 6 USDT capital allows and is lowered to 95% of it, 5.7. (Its repeated losing closes would
+    // otherwise calibrate the 60% forecast down and shrink the suggested size.)
     api::validate(&cfg).unwrap();
     cfg.exchange = model::Credentials {
         key: "test".into(),
@@ -166,7 +168,7 @@ async fn execution_is_durable_and_closing_releases_position_slots() {
         login_attempts: Mutex::new(vec![]),
         hooks: Default::default(),
     });
-    let actions = json!([{"action":"open_long","pair":"BTC/USDT","confidence":0.9},{"action":"open_long","pair":"ETH/USDT","confidence":0.9}]);
+    let actions = json!([{"action":"open_long","pair":"BTC/USDT","confidence":0.9,"win_prob":0.6,"margin_usdt":100},{"action":"open_long","pair":"ETH/USDT","confidence":0.9,"win_prob":0.6,"margin_usdt":100}]);
     let result = app
         .execute_actions(actions.as_array().unwrap(), false)
         .await
@@ -839,7 +841,7 @@ fn age_open_trades(app: &App, minutes: i64) {
 }
 
 fn open_long(pair: &str) -> Value {
-    json!({"action":"open_long","pair":pair,"confidence":0.9,"reason":"突破后回踩确认","stop_loss_pct":4.0,"take_profit_pct":8.0})
+    json!({"action":"open_long","pair":pair,"confidence":0.9,"win_prob":0.6,"reason":"突破后回踩确认","stop_loss_pct":4.0,"take_profit_pct":8.0})
 }
 
 #[tokio::test]
@@ -1077,14 +1079,23 @@ async fn ai_allocates_margin_and_leverage_within_the_limits() {
         let _lock = app.gate.lock().await;
         app.close_position(t.trade_id, "force_exit").await.unwrap();
     }
-    // Without a margin the free funds are split over the 5 slots: 190 × 5 at 10 is 95.
+    // Without a margin the system sizes by its forecast: the two earlier 60% forecasts both
+    // lost, so 60% calibrates to (0 + 10 × 0.6) / 12 = 50%; at 2R that is still worth +0.47R,
+    // half Kelly is about 12% of equity and the 5% cap applies: 50 lost at a 4% stop is a
+    // 1250 position, 125 contracts at 10.
     let result = app
         .execute_actions(&[open_long("BTC/USDT:USDT")], false)
         .await
         .unwrap();
     assert_eq!(result[0]["status"], "executed", "{}", result[0]);
+    let sizing = &result[0]["sizing"];
+    assert_eq!(sizing["margin_source"], "kelly", "{sizing}");
+    assert!((sizing["edge"]["calibrated_win_prob"].as_f64().unwrap() - 0.5).abs() < 1e-9);
+    assert!((sizing["kelly_risk_pct"].as_f64().unwrap() - 5.0).abs() < 1e-9);
     let t = app.store.open_trades().unwrap().remove(0);
-    assert!((t.amount - 95.0).abs() < 1e-9, "{}", t.amount);
+    assert!((t.amount - 125.0).abs() < 1e-9, "{}", t.amount);
+    assert_eq!(t.win_prob, Some(0.6));
+    assert!((t.planned_rr.unwrap() - 2.0).abs() < 1e-9);
     {
         let _lock = app.gate.lock().await;
         app.close_position(t.trade_id, "force_exit").await.unwrap();
@@ -1558,6 +1569,8 @@ async fn a_review_reads_closed_trades_and_writes_notes() {
             stop_dist: 0.05,
             entry_reason: "突破".into(),
             funding: 0.0,
+            win_prob: None,
+            planned_rr: None,
         };
         store.insert_trade(t, "").unwrap();
     }
@@ -1899,6 +1912,66 @@ async fn ai_adds_to_an_open_position_at_its_leverage_and_stop() {
         let _lock = app.gate.lock().await;
         app.tick().await.unwrap();
     }
+    server.abort();
+    std::env::remove_var("BYBIT_BASE_URL");
+    drop(app);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn ai_entries_need_a_forecast_with_a_positive_calibrated_edge() {
+    let _env = EXCHANGE.lock().await;
+    let sim = Arc::new(Mutex::new(Sim {
+        futures: true,
+        price: 10.0,
+        ..Sim::default()
+    }));
+    let cfg = model::Config {
+        market: "futures".into(),
+        pairs: vec!["BTC/USDT:USDT".into()],
+        leverage: 5,
+        short: true,
+        ..model::Config::default()
+    };
+    let (app, dir, server) = sim_app(&sim, cfg).await;
+    // A 30% forecast at 2R is worth 0.3 × 2 − 0.7 − fees: negative, so nothing is sent.
+    let mut weak = open_long("BTC/USDT:USDT");
+    weak["win_prob"] = json!(0.3);
+    let mut silent = open_long("BTC/USDT:USDT");
+    silent.as_object_mut().unwrap().remove("win_prob");
+    let mut nonsense = open_long("BTC/USDT:USDT");
+    nonsense["win_prob"] = json!(1.5);
+    for (bad, why) in [
+        (weak, "不为正"),
+        (silent, "win_prob"),
+        (nonsense, "win_prob"),
+    ] {
+        let result = app.execute_actions(&[bad], false).await.unwrap();
+        assert_eq!(result[0]["status"], "failed", "{}", result[0]);
+        assert!(
+            result[0]["note"].as_str().unwrap().contains(why),
+            "{}",
+            result[0]
+        );
+    }
+    assert_eq!(sim.lock().await.count, 0);
+    // The operator's own order through the API carries no forecast and is not gated by one.
+    let manual =
+        json!({"action":"open_long","pair":"BTC/USDT:USDT","stop_loss_pct":4.0,"margin_usdt":20});
+    let result = app.execute_actions(&[manual], true).await.unwrap();
+    assert_eq!(result[0]["status"], "executed", "{}", result[0]);
+    assert_eq!(result[0]["sizing"]["margin_source"], "ai");
+    assert!(result[0]["sizing"]["edge"].is_null());
+    assert_eq!(app.store.open_trades().unwrap()[0].win_prob, None);
+    // The model is shown its calibration so far and how entries are sized from it.
+    let snap = app.snapshot().await.unwrap();
+    assert_eq!(snap["calibration"]["trades_with_forecast"], 0);
+    assert_eq!(
+        snap["calibration"]["by_forecast"].as_array().unwrap().len(),
+        5
+    );
+    assert_eq!(snap["sizing_policy"]["kelly_fraction"], 0.5);
+    assert_eq!(snap["sizing_policy"]["kelly_cap_pct"], 5.0);
     server.abort();
     std::env::remove_var("BYBIT_BASE_URL");
     drop(app);

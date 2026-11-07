@@ -1,4 +1,5 @@
 use crate::{
+    calibration::{self, Calibration},
     exchange::{category, quantize, symbol, Bybit, Fill},
     indicators,
     model::{day, now, num, AiConfig, Config, Trade},
@@ -194,6 +195,8 @@ pub struct Stops {
     pub leverage: Option<u32>,
     /// The AI's reason for opening, kept on the trade.
     pub reason: Option<String>,
+    /// The AI's forecast that the trade closes in profit; required for its own entries.
+    pub win_prob: Option<f64>,
 }
 /// Smallest tradable order value in USDT: the exchange minimum rounded up to a whole quantity step.
 pub fn min_order_notional(ins: &Value, futures: bool, price: f64) -> Option<f64> {
@@ -615,7 +618,7 @@ impl App {
         tag: &str,
         confidence: Option<f64>,
         stops: Stops,
-    ) -> Result<()> {
+    ) -> Result<Value> {
         // Caller must hold gate from fresh risk checks through durable reservation and submission.
         let c = self.store.config()?;
         self.reconcile(&c).await?;
@@ -675,6 +678,38 @@ impl App {
         if let Some(m) = stops.margin_usdt {
             ensure!(m.is_finite() && m > 0.0, "保证金金额无效");
         }
+        // The AI's own entries carry a forecast. It is calibrated against how past forecasts in
+        // the same range ended, the entry is refused without a positive expected result after
+        // fees, and a share of Kelly sizes it unless the AI sets the margin itself.
+        let planned_rr = (take_profit - price).abs() / (price * stop);
+        let edge = match confidence {
+            None => None,
+            Some(_) => {
+                let p = stops
+                    .win_prob
+                    .context("AI 开仓需要给出 win_prob（这笔单盈利平仓的概率）")?;
+                ensure!(
+                    p.is_finite() && (0.0..=1.0).contains(&p),
+                    "win_prob 必须在 0 到 1 之间"
+                );
+                let cal = Calibration::from_trades(&self.store.trades()?);
+                let e = calibration::edge(&cal, p, planned_rr, stop);
+                ensure!(
+                    e.ev_r > 0.0,
+                    "按校准后胜率 {:.0}%、盈亏比 {:.2}、手续费 {:.2}R 计算，期望 {:+.2}R 不为正，不开仓",
+                    e.win_prob * 100.0,
+                    e.payoff,
+                    e.fee_r,
+                    e.ev_r
+                );
+                Some(e)
+            }
+        };
+        let base = c.capital.map_or(equity, |cap| cap.min(equity));
+        let kelly_risk = edge
+            .as_ref()
+            .map(|e| calibration::suggested_risk(e, c.ai.kelly_fraction, c.ai.kelly_cap_pct));
+        let kelly_margin = kelly_risk.map(|r| base * r / stop / leverage as f64);
         if futures {
             let account = ex.get("/v5/account/info", json!({}), true).await?;
             ensure!(
@@ -728,7 +763,7 @@ impl App {
             .context("交易所价格或下单精度无效")?
             / leverage as f64;
         let stake = entry_margin(
-            stops.margin_usdt,
+            stops.margin_usdt.or(kelly_margin),
             budget,
             c.max_open - held.len(),
             min_stake,
@@ -780,7 +815,22 @@ impl App {
             stop_dist: stop,
             entry_reason: stops.reason.clone().unwrap_or_default(),
             funding: 0.0,
+            win_prob: stops.win_prob.filter(|_| edge.is_some()),
+            planned_rr: Some(planned_rr),
         };
+        // What sized this entry, for the decision record and the AI's next run.
+        let sizing = json!({
+            "margin_usdt":t.stake_amount,
+            "leverage":leverage,
+            "position_usdt":amount * price,
+            "stop_pct":stop * 100.0,
+            "loss_at_stop_usdt":amount * price * stop,
+            "planned_rr":planned_rr,
+            "margin_source":if stops.margin_usdt.is_some() {"ai"} else if kelly_margin.is_some() {"kelly"} else {"split"},
+            "kelly_margin_usdt":kelly_margin,
+            "kelly_risk_pct":kelly_risk.map(|r| r * 100.0),
+            "edge":edge.as_ref().map(|e| e.to_json()),
+        });
         let mut body = json!({"category":category(&c.market),"symbol":symbol(pair),"side":if short{"Sell"}else{"Buy"},"orderType":"Market","qty":qty,"orderLinkId":link});
         if futures {
             let tick = ins["priceFilter"]["tickSize"]
@@ -819,7 +869,7 @@ impl App {
                 &format!("开仓 {} {}", pair, if short { "空" } else { "多" }),
             )
             .await;
-        Ok(())
+        Ok(sizing)
     }
     /// Add margin to an open futures position of Tide's, in the same direction and at its
     /// leverage. The stop and take profit stay; the add is refused if, at the new average entry,
@@ -1616,6 +1666,8 @@ mod tests {
             stop_dist: 0.05,
             entry_reason: String::new(),
             funding: 0.0,
+            win_prob: None,
+            planned_rr: None,
         };
         assert!(check_new_stops(&t, 110.0, Some(105.0), Some(120.0)).is_ok());
         assert!(check_new_stops(&t, 110.0, Some(95.0), None).is_ok());
@@ -1656,6 +1708,8 @@ mod tests {
             stop_dist: 0.05,
             entry_reason: String::new(),
             funding: 0.0,
+            win_prob: None,
+            planned_rr: None,
         }
     }
     #[test]
