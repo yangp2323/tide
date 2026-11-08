@@ -2,6 +2,7 @@
 //! so lessons come from this account's results instead of only from hand-written notes.
 use crate::{
     ai::{call_model_for, clip, extract_json, Prompt},
+    calibration::realized_r,
     model::{now, Trade},
     App,
 };
@@ -11,9 +12,11 @@ use std::collections::BTreeMap;
 
 const MAX_AI_NOTES: usize = 12;
 
-const SYSTEM: &str = r#"You are the post-trade reviewer for a crypto trading AI that manages a real Bybit account. Study its closed trades and write durable observations that will improve its future decisions.
-forecast_calibration shows how the trader's win_prob forecasts held up by range: note systematic over- or under-confidence and the setups behind it, with the sample size. Position size is set by the system from calibrated forecasts and a share of Kelly, so do not write fixed per-trade risk amounts, sizing caps or "match the other trades' risk" as rules. Rules: base every claim on the supplied trades and statistics and state the sample size. With fewer than 5 relevant trades call something a hypothesis, not a finding, and never build a lesson on one trade. Separate process (the entry thesis, stop distance, sizing, the exit decision, overtrading, holding time) from luck, and prefer patterns you can act on: which setups and exits made or lost money, pair and direction effects, how stop distance and holding time related to results, whether discretionary closes beat the exchange-hosted stops. exit_reason external_close means the operator closed the position by hand on the exchange: it is not a stop-out or a take profit, so draw no lesson about stops or targets from it. Costs matter: results are net of fees and funding.
-You may add, update or delete only notes listed under ai_notes (they have ids), and keep at most max_ai_notes of them: merge duplicates and delete notes the new evidence contradicts. Do not repeat what other_note_titles already cover. A note must never tell the trader to break risk limits. Account-level loss limits are enforced by the system, so never write notes about how much the account lost today, the remaining loss allowance, or trading less after losses. Each note is at most 900 characters of 简体中文 with a short title.
+const SYSTEM: &str = r#"You are the post-trade reviewer for a crypto trading AI that manages a real Bybit account. Study its closed trades and distil durable lessons that will improve its future decisions.
+A note is a distilled lesson, not a ledger: state the pattern, why it matters and what to do, in a few short points. Do not list individual trades, dates, prices or running totals, and do not append a new section at each review: when new evidence arrives, rewrite the note so it states the current conclusion, or merge it into another note. A sample size and whether the lesson is still a hypothesis are enough to show how far to trust it. Base every lesson on the supplied trades and statistics. With fewer than 5 relevant trades call it a hypothesis, not a finding, and never build a lesson on one trade.
+Judge decisions by process and by results in R (result_r and avg_r: the price move over the initial stop distance), never by whether a trade or a group of trades made or lost money. USDT totals mix very different position sizes, and a trade that followed its plan and hit its stop was a good decision, while one that broke its plan and happened to profit was not. Ask whether the entry had the thesis it claimed, whether the stop and target fitted the move, whether the exit followed the plan written at entry, and which setups, pairs, directions, stop distances and holding times gave better average R. Results are net of fees and funding, so costs are part of the result.
+forecast_calibration shows how the trader's win_prob forecasts held up by range: note systematic over- or under-confidence and the setups behind it. Position size is set by the system from calibrated forecasts and a share of Kelly, so do not write fixed per-trade risk amounts, sizing caps or "match the other trades' risk" as rules. exit_reason external_close means the operator closed the position by hand on the exchange: it is not the trader's exit, a stop-out or a take profit, so draw no lesson from it about stops, targets or discretionary closes.
+You may add, update or delete only notes listed under ai_notes (they have ids), and keep at most max_ai_notes of them: merge duplicates and delete notes the new evidence contradicts. Do not repeat what other_note_titles already cover. A note must never tell the trader to break risk limits. Account-level loss limits are enforced by the system, so never write notes about how much the account lost today, the remaining loss allowance, or trading less after losses. Each note is at most 500 characters of 简体中文 with a short title.
 Return only a JSON object {"summary":"简体中文复盘总结，说明样本量和最重要的发现","changes":[{"op":"add|update|delete","id":123,"title":"标题","content":"内容"}]}. id is required for update and delete only. An empty changes array is correct when the data supports nothing new."#;
 
 pub const REVIEW: Prompt = Prompt {
@@ -28,17 +31,27 @@ fn hold_minutes(t: &Trade) -> Option<f64> {
     Some((close - open).num_seconds() as f64 / 60.0)
 }
 
+/// Average result in R, or null without trades that recorded a stop.
+fn avg_r(r: &[f64]) -> Value {
+    if r.is_empty() {
+        Value::Null
+    } else {
+        json!(r.iter().sum::<f64>() / r.len() as f64)
+    }
+}
+
 fn group(trades: &[&Trade], key: impl Fn(&Trade) -> String) -> Value {
-    let mut map: BTreeMap<String, (usize, usize, f64)> = BTreeMap::new();
+    let mut map: BTreeMap<String, (usize, usize, f64, Vec<f64>)> = BTreeMap::new();
     for t in trades {
         let e = map.entry(key(t)).or_default();
         e.0 += 1;
         e.1 += (t.profit_abs > 0.0) as usize;
         e.2 += t.profit_abs;
+        e.3.extend(realized_r(t));
     }
     json!(map
         .into_iter()
-        .map(|(k, (n, wins, profit))| (k, json!({"trades":n,"wins":wins,"profit_usdt":profit})))
+        .map(|(k, (n, wins, profit, r))| (k, json!({"trades":n,"wins":wins,"profit_usdt":profit,"avg_r":avg_r(&r),"trades_with_r":r.len()})))
         .collect::<serde_json::Map<_, _>>())
 }
 
@@ -64,6 +77,7 @@ pub fn trade_stats(trades: &[Trade]) -> Value {
         }
     };
     let holds: Vec<f64> = closed.iter().filter_map(|t| hold_minutes(t)).collect();
+    let r: Vec<f64> = closed.iter().filter_map(|t| realized_r(t)).collect();
     json!({
         "overall":{
             "trades":closed.len(),
@@ -74,6 +88,8 @@ pub fn trade_stats(trades: &[Trade]) -> Value {
             "avg_loss_usdt":avg(&losses),
             "profit_factor":if loss < 0.0 {json!(gain / -loss)} else {Value::Null},
             "avg_hold_minutes":avg(&holds),
+            "avg_r":avg_r(&r),
+            "trades_with_r":r.len(),
         },
         "by_exit_reason":group(&closed, |t| t.exit_reason.clone().unwrap_or_default()),
         "by_pair_and_side":group(&closed, |t| format!("{} {}", t.pair, if t.is_short {"short"} else {"long"})),
@@ -168,7 +184,7 @@ impl App {
                 .iter()
                 .take(40)
                 .map(|t| {
-                    json!({"pair":t.pair,"side":if t.is_short{"short"}else{"long"},"leverage":t.leverage,"opened_utc":t.open_date,"closed_utc":t.close_date,"hold_minutes":hold_minutes(t).map(|m| m.round()),"profit_usdt":t.profit_abs,"profit_pct_on_margin":t.profit_ratio*100.0,"exit_reason":t.exit_reason,"stop_distance_pct":t.stop_dist*100.0,"entry_reason":clip(&t.entry_reason, 300)})
+                    json!({"pair":t.pair,"side":if t.is_short{"short"}else{"long"},"leverage":t.leverage,"opened_utc":t.open_date,"closed_utc":t.close_date,"hold_minutes":hold_minutes(t).map(|m| m.round()),"profit_usdt":t.profit_abs,"profit_pct_on_margin":t.profit_ratio*100.0,"exit_reason":t.exit_reason,"stop_distance_pct":t.stop_dist*100.0,"result_r":realized_r(t),"win_prob":t.win_prob,"entry_reason":clip(&t.entry_reason, 300)})
                 })
                 .collect();
             let snap = json!({"time_utc":now(),"stats":trade_stats(&closed),"forecast_calibration":crate::calibration::Calibration::from_trades(&closed).to_json(),"recent_trades":recent,"ai_notes":mine,"max_ai_notes":MAX_AI_NOTES,"other_note_titles":others});
@@ -324,6 +340,16 @@ mod tests {
         assert_eq!(s["overall"]["profit_factor"], 4.0 / 3.0);
         assert_eq!(s["by_exit_reason"]["force_exit"]["profit_usdt"], -3.0);
         assert_eq!(s["by_exit_reason"]["stoploss_on_exchange"]["wins"], 2);
+        // Results in R: a close at the entry is 0R; a 10% fall on a 5% stop is -2R.
+        assert_eq!(s["by_exit_reason"]["stoploss_on_exchange"]["avg_r"], 0.0);
+        let mut deep = trade("BTC/USDT:USDT", false, -2.0, "stoploss_on_exchange", 2);
+        deep.close_rate = Some(90.0);
+        let d = trade_stats(&[deep]);
+        assert!((d["overall"]["avg_r"].as_f64().unwrap() + 2.0).abs() < 1e-9);
+        assert_eq!(
+            d["by_exit_reason"]["stoploss_on_exchange"]["trades_with_r"],
+            1
+        );
         assert_eq!(s["by_pair_and_side"]["XRP/USDT:USDT long"]["trades"], 2);
         assert_eq!(s["by_holding_time"]["under 1h"]["trades"], 1);
         assert_eq!(s["by_holding_time"]["1h to 4h"]["trades"], 1);
