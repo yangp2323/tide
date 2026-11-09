@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 
 /// Hard limit the AI cannot exceed. Direction, how many positions to hold and how much capital
 /// to commit to each are the AI's decisions inside it.
-pub const MAX_OPEN: usize = 5;
+pub const MAX_OPEN: usize = 4;
 /// The AI may not close a position it has held for less than this; the stop still protects it.
 /// It stops a run from abandoning the previous run's entry on the same evidence.
 pub const MIN_HOLD_BEFORE_AI_CLOSE_MINUTES: i64 = 60;

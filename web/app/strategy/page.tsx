@@ -51,7 +51,7 @@ export default function StrategyPage() {
   const fut = cur.market === "futures";
   const maxPairs = d.max_pairs ?? 12;
   const maxLev = d.max_leverage ?? 25;
-  const openCap = d.max_open_limit ?? 5;
+  const openCap = d.max_open_limit ?? 4;
   // 止损由 AI 给出（默认参考 2.5×ATR），限制在 2%–10%；系统按止损距离逐笔下调杠杆，使止损不超过强平距离的 60%。
   const stopLo = 0.02;
   const stopHi = 0.1;

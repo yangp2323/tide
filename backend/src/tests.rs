@@ -10,7 +10,7 @@ use std::future::IntoFuture;
 #[test]
 fn capital_limit_does_not_require_funding_all_slots() {
     let mut cfg = model::Config {
-        max_open: 5,
+        max_open: model::MAX_OPEN,
         ..model::Config::default()
     };
     for capital in [0.5, 6.0, 20.0] {
@@ -1127,13 +1127,13 @@ async fn ai_allocates_margin_and_leverage_within_the_limits() {
     }
     config.min_leverage = 1;
     app.store.save_config(&config).unwrap();
-    // With 5 slots every AI entry commits at least 1000 / 5 = 200: a 10 USDT request is raised
-    // to it, 200 at 5x is 100 contracts at 10.
-    config.max_open = 5;
+    // With 4 slots every AI entry commits at least 1000 / 4 = 250: a 10 USDT request is raised
+    // to it, 250 at 5x is 125 contracts at 10.
+    config.max_open = 4;
     app.store.save_config(&config).unwrap();
     assert_eq!(
         app.snapshot().await.unwrap()["trade_limits"]["min_margin_per_entry_usdt"],
-        200.0
+        250.0
     );
     let mut action = open_long("BTC/USDT:USDT");
     action["margin_usdt"] = json!(10);
@@ -1143,9 +1143,9 @@ async fn ai_allocates_margin_and_leverage_within_the_limits() {
     let sizing = &result[0]["sizing"];
     assert_eq!(sizing["margin_source"], "floor", "{sizing}");
     assert_eq!(sizing["requested_margin_usdt"], 10.0);
-    assert_eq!(sizing["min_margin_usdt"], 200.0);
+    assert_eq!(sizing["min_margin_usdt"], 250.0);
     let t = app.store.open_trades().unwrap().remove(0);
-    assert!((t.amount - 100.0).abs() < 1e-9, "{}", t.amount);
+    assert!((t.amount - 125.0).abs() < 1e-9, "{}", t.amount);
     {
         let _lock = app.gate.lock().await;
         app.close_position(t.trade_id, "force_exit").await.unwrap();
@@ -1385,6 +1385,30 @@ fn model_use_is_summed_per_day_across_provider_shapes() {
         (Some(50), Some(50))
     );
     assert_eq!(d["by_source"]["auto"], 2);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_lower_position_cap_carries_over_to_the_saved_config() {
+    let dir = std::env::temp_dir().join(format!("tide-cap-{}", uuid::Uuid::new_v4()));
+    let store = store::Store::open(&dir).unwrap();
+    // A configuration saved under the old cap of 5.
+    let mut c = store.config().unwrap();
+    c.max_open = 5;
+    store.save_config(&c).unwrap();
+    store.set_state("max_open_cap", "5").unwrap();
+    drop(store);
+    let store = store::Store::open(&dir).unwrap();
+    assert_eq!(store.config().unwrap().max_open, model::MAX_OPEN);
+    assert_eq!(model::MAX_OPEN, 4);
+    // A lower saved limit is kept, and the step runs once per cap.
+    let mut c = store.config().unwrap();
+    c.max_open = 2;
+    store.save_config(&c).unwrap();
+    drop(store);
+    let store = store::Store::open(&dir).unwrap();
+    assert_eq!(store.config().unwrap().max_open, 2);
+    drop(store);
     std::fs::remove_dir_all(dir).unwrap();
 }
 

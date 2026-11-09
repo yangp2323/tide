@@ -121,6 +121,18 @@ impl Store {
             }
             self.set_state("ai_limits_v1", "1")?;
         }
+        // When the position cap changes, a saved limit above it follows it down.
+        let cap = crate::model::MAX_OPEN.to_string();
+        if self.state("max_open_cap")?.as_deref() != Some(cap.as_str()) {
+            if self.dir.join("config.json").exists() {
+                let mut c = self.config()?;
+                if c.max_open > crate::model::MAX_OPEN {
+                    c.max_open = crate::model::MAX_OPEN;
+                    self.save_config(&c)?;
+                }
+            }
+            self.set_state("max_open_cap", &cap)?;
+        }
         Ok(())
     }
     pub fn config(&self) -> Result<Config> {

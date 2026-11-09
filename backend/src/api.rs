@@ -116,7 +116,11 @@ pub fn validate(c: &Config) -> Result<()> {
         !c.pairs.is_empty() && c.pairs.len() <= 12,
         "选择 1 到 12 个币"
     );
-    ensure!((1..=5).contains(&c.max_open), "持仓数在 1 到 5 之间");
+    ensure!(
+        (1..=crate::model::MAX_OPEN).contains(&c.max_open),
+        "持仓数在 1 到 {} 之间",
+        crate::model::MAX_OPEN
+    );
     ensure!((1..=25).contains(&c.leverage), "杠杆在 1 到 25 之间");
     ensure!(
         c.market == "futures" || c.leverage == 1 && c.min_leverage == 1 && !c.short,
@@ -710,7 +714,7 @@ pub async fn overview(app: &App) -> Result<Value> {
             json!({"date":day,"abs_profit":daily.get(&day).copied().unwrap_or(0.0)})
         })
         .collect();
-    let mut out = json!({"engine":"rust","server_ip":std::env::var("SERVER_IP").unwrap_or_default(),"key":mask(&c.exchange.key),"telegram":c.telegram.enabled,"capital":c.capital,"market":c.market,"leverage":c.leverage,"min_leverage":c.min_leverage,"short":c.short,"pairs":c.pairs,"max_open":c.max_open,"max_pairs":12,"max_open_limit":5,"max_leverage":25,"max_same_direction":c.max_same_direction,"stop_rule":"AI 设置，2%–10%","ai":c.ai.enabled,"state":if c.running{"running"}else{"stopped"},"strategy":"AI","timeframe":"4h","open":[],"watch":[],"daily":days,"recent":closed.iter().take(5).collect::<Vec<_>>(),"profit":{"profit_closed_coin":profit,"profit_closed_ratio_mean":if closed.is_empty(){0.0}else{closed.iter().map(|t|t.profit_ratio).sum::<f64>()/closed.len() as f64},"closed_trade_count":closed.len(),"winning_trades":closed.iter().filter(|t|t.profit_abs>0.0).count(),"losing_trades":closed.iter().filter(|t|t.profit_abs<=0.0).count()}});
+    let mut out = json!({"engine":"rust","server_ip":std::env::var("SERVER_IP").unwrap_or_default(),"key":mask(&c.exchange.key),"telegram":c.telegram.enabled,"capital":c.capital,"market":c.market,"leverage":c.leverage,"min_leverage":c.min_leverage,"short":c.short,"pairs":c.pairs,"max_open":c.max_open,"max_pairs":12,"max_open_limit":crate::model::MAX_OPEN,"max_leverage":25,"max_same_direction":c.max_same_direction,"stop_rule":"AI 设置，2%–10%","ai":c.ai.enabled,"state":if c.running{"running"}else{"stopped"},"strategy":"AI","timeframe":"4h","open":[],"watch":[],"daily":days,"recent":closed.iter().take(5).collect::<Vec<_>>(),"profit":{"profit_closed_coin":profit,"profit_closed_ratio_mean":if closed.is_empty(){0.0}else{closed.iter().map(|t|t.profit_ratio).sum::<f64>()/closed.len() as f64},"closed_trade_count":closed.len(),"winning_trades":closed.iter().filter(|t|t.profit_abs>0.0).count(),"losing_trades":closed.iter().filter(|t|t.profit_abs<=0.0).count()}});
     let result:Result<()> =async {
         let ticks=ex.tickers(&c.market).await?;let mut open=vec![];for t in &held{let p=ticks["list"].as_array().and_then(|a|a.iter().find(|p|p["symbol"]==symbol(&t.pair))).context("持仓行情缺失")?;open.push(t.mark(num(&p["lastPrice"])));}
         out["open"]=json!(open);
