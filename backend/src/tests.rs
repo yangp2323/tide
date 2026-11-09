@@ -855,6 +855,8 @@ async fn futures_stops_follow_ai_trail_and_external_take_profit() {
     let cfg = model::Config {
         market: "futures".into(),
         pairs: vec!["BTC/USDT:USDT".into()],
+        // 1000 over 20 slots: a 50 USDT entry sits exactly at the per-entry minimum.
+        max_open: 20,
         leverage: 5,
         short: true,
         ..model::Config::default()
@@ -1047,6 +1049,9 @@ async fn ai_allocates_margin_and_leverage_within_the_limits() {
     let cfg = model::Config {
         market: "futures".into(),
         pairs: vec!["BTC/USDT:USDT".into()],
+        // Enough slots that the per-entry minimum (1000 / slots) stays out of the way until
+        // the end of the test.
+        max_open: 10_000,
         leverage: 5,
         short: true,
         ..model::Config::default()
@@ -1121,6 +1126,31 @@ async fn ai_allocates_margin_and_leverage_within_the_limits() {
         app.close_position(t.trade_id, "force_exit").await.unwrap();
     }
     config.min_leverage = 1;
+    app.store.save_config(&config).unwrap();
+    // With 5 slots every AI entry commits at least 1000 / 5 = 200: a 10 USDT request is raised
+    // to it, 200 at 5x is 100 contracts at 10.
+    config.max_open = 5;
+    app.store.save_config(&config).unwrap();
+    assert_eq!(
+        app.snapshot().await.unwrap()["trade_limits"]["min_margin_per_entry_usdt"],
+        200.0
+    );
+    let mut action = open_long("BTC/USDT:USDT");
+    action["margin_usdt"] = json!(10);
+    action["leverage"] = json!(5);
+    let result = app.execute_actions(&[action], false).await.unwrap();
+    assert_eq!(result[0]["status"], "executed", "{}", result[0]);
+    let sizing = &result[0]["sizing"];
+    assert_eq!(sizing["margin_source"], "floor", "{sizing}");
+    assert_eq!(sizing["requested_margin_usdt"], 10.0);
+    assert_eq!(sizing["min_margin_usdt"], 200.0);
+    let t = app.store.open_trades().unwrap().remove(0);
+    assert!((t.amount - 100.0).abs() < 1e-9, "{}", t.amount);
+    {
+        let _lock = app.gate.lock().await;
+        app.close_position(t.trade_id, "force_exit").await.unwrap();
+    }
+    config.max_open = 10_000;
     app.store.save_config(&config).unwrap();
     // Below the exchange minimum (5 USDT of position) is refused with the margin it needs.
     let mut action = open_long("BTC/USDT:USDT");
@@ -1624,6 +1654,8 @@ async fn open_trades_raise_hook_events_as_they_move() {
     let mut cfg = model::Config {
         market: "futures".into(),
         pairs: vec!["BTC/USDT:USDT".into()],
+        // 1000 over 20 slots: a 50 USDT entry sits exactly at the per-entry minimum.
+        max_open: 20,
         leverage: 5,
         short: true,
         ..model::Config::default()
@@ -1822,6 +1854,8 @@ async fn ai_adds_to_an_open_position_at_its_leverage_and_stop() {
     let cfg = model::Config {
         market: "futures".into(),
         pairs: vec!["BTC/USDT:USDT".into()],
+        // 1000 over 20 slots: a 50 USDT entry sits exactly at the per-entry minimum.
+        max_open: 20,
         leverage: 5,
         short: true,
         ..model::Config::default()

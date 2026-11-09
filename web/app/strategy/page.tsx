@@ -304,6 +304,7 @@ export default function StrategyPage() {
             <b>方向和仓位</b>
             <p>
               {fut ? "做多还是做空、同时持有几笔、每笔投入多少可用资金，都由 AI 根据行情灵活分配，没有开关。" : "现货只能做多。同时持有几笔、每笔投入多少可用资金，由 AI 根据行情灵活分配，没有开关。"}
+              {` AI 每笔开仓至少投入交易资金的 1/${openCap} 作为保证金，凯利建议或 AI 指定得更少时按这个下限下单，可用资金不够时按剩余的下单。`}
             </p>
             <div className="risk" style={{ marginTop: 12 }}>
               <div>

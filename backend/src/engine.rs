@@ -169,6 +169,11 @@ pub fn entry_margin(
         None => entry_stake(budget, slots, minimum),
     }
 }
+/// Least margin an AI entry commits: the sizing equity split over the position slots, so no
+/// entry is smaller than an even share of the capital. What is free may still lower it.
+pub fn min_entry_margin(base: f64, max_open: usize) -> Option<f64> {
+    (base.is_finite() && base > 0.0 && max_open > 0).then(|| base / max_open as f64)
+}
 /// Position slots are an upper bound; reserve 5% and divide only among affordable slots.
 pub fn entry_stake(budget: f64, slots: usize, minimum: f64) -> Option<f64> {
     if !budget.is_finite() || budget <= 0.0 || slots == 0 || !minimum.is_finite() || minimum < 0.0 {
@@ -759,6 +764,12 @@ impl App {
             .as_ref()
             .map(|e| calibration::suggested_risk(e, c.ai.kelly_fraction, c.ai.kelly_cap_pct));
         let kelly_margin = kelly_risk.map(|r| base * r / stop / leverage as f64);
+        // AI entries commit at least an even share of the capital, whatever Kelly or the AI
+        // asked for.
+        let floor = edge.as_ref().and(min_entry_margin(base, c.max_open));
+        let chosen = stops.margin_usdt.or(kelly_margin);
+        let raised = matches!((chosen, floor), (Some(m), Some(f)) if m < f);
+        let requested = chosen.map(|m| floor.map_or(m, |f| m.max(f)));
         if futures {
             let account = ex.get("/v5/account/info", json!({}), true).await?;
             ensure!(
@@ -811,13 +822,8 @@ impl App {
         let min_stake = min_order_notional(&ins, futures, price)
             .context("交易所价格或下单精度无效")?
             / leverage as f64;
-        let stake = entry_margin(
-            stops.margin_usdt.or(kelly_margin),
-            budget,
-            c.max_open - held.len(),
-            min_stake,
-        )
-        .context("可用预算预留 5% 后不足该交易对的最小下单要求")?;
+        let stake = entry_margin(requested, budget, c.max_open - held.len(), min_stake)
+            .context("可用预算预留 5% 后不足该交易对的最小下单要求")?;
         ensure!(
             stake.is_finite() && stake >= min_stake,
             "按 {:.2} USDT 保证金、{} 倍杠杆计算的仓位低于交易所最小下单额（至少需要 {:.2} USDT 保证金）",
@@ -875,7 +881,9 @@ impl App {
             "stop_pct":stop * 100.0,
             "loss_at_stop_usdt":amount * price * stop,
             "planned_rr":planned_rr,
-            "margin_source":if stops.margin_usdt.is_some() {"ai"} else if kelly_margin.is_some() {"kelly"} else {"split"},
+            "margin_source":if raised {"floor"} else if stops.margin_usdt.is_some() {"ai"} else if kelly_margin.is_some() {"kelly"} else {"split"},
+            "requested_margin_usdt":chosen,
+            "min_margin_usdt":floor,
             "kelly_margin_usdt":kelly_margin,
             "kelly_risk_pct":kelly_risk.map(|r| r * 100.0),
             "edge":edge.as_ref().map(|e| e.to_json()),
@@ -1753,6 +1761,13 @@ mod tests {
             win_prob: None,
             planned_rr: None,
         }
+    }
+    #[test]
+    fn entries_commit_at_least_an_even_share_of_the_capital() {
+        assert_eq!(min_entry_margin(20.0, 5), Some(4.0));
+        assert_eq!(min_entry_margin(20.0, 0), None);
+        assert_eq!(min_entry_margin(0.0, 5), None);
+        assert_eq!(min_entry_margin(f64::NAN, 5), None);
     }
     #[test]
     fn exchange_closes_are_labelled_by_their_origin() {
